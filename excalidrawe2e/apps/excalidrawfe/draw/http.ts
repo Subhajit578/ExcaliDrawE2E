@@ -1,13 +1,20 @@
 import axios from "axios";
-
+type ShapeRow = {
+    id: number;
+    type: string;
+    data: any; 
+    roomId: number;
+    userId: string;
+  };
 export async function getExistingShapes(roomId: string) {
-    const res = await axios.get(`http://localhost:3001/chats/${roomId}`);
-    const messages = res.data.messages;
+    const token = localStorage.getItem("token")
+    const res = await axios.get(`http://localhost:3001/shapes/${roomId}`, {headers : {
+        Authorization : `Bearer ${token}`
+    }});
+    const shapes:ShapeRow[] = res.data.shapes;
 
-    const shapes = messages.map((x: {message: string}) => {
-        const messageData = JSON.parse(x.message)
-        return messageData.shape;
-    })
 
-    return shapes;
+    return shapes.map(s => ({
+        type:s.type,  ...s.data
+    }));
 }

@@ -18,7 +18,13 @@ type Shape = {
     endX: number;
     endY: number;
 }
-
+type ShapeRow = {
+    id: number;
+    type: string;
+    data: any; 
+    roomId: number;
+    userId: string;
+  };
 export async function initDraw(canvas: HTMLCanvasElement, roomId: string, socket: WebSocket) {
     const ctx = canvas.getContext("2d");
 
@@ -31,9 +37,15 @@ export async function initDraw(canvas: HTMLCanvasElement, roomId: string, socket
     socket.onmessage = (event) => {
         const message = JSON.parse(event.data);
 
-        if (message.type == "chat") {
-            const parsedShape = JSON.parse(message.message)
-            existingShapes.push(parsedShape.shape)
+        if (message.type == "shape") {
+            const incomingShape = message.shape;
+            if (!incomingShape?.type || !incomingShape?.data) {
+                return;
+            }
+            existingShapes.push({
+                type: incomingShape.type,
+                ...incomingShape.data
+            } as Shape)
             clearCanvas(existingShapes, canvas, ctx);
         }
     }
@@ -82,12 +94,14 @@ export async function initDraw(canvas: HTMLCanvasElement, roomId: string, socket
         }
 
         existingShapes.push(shape);
+        const { type, ...data } = shape;
 
         socket.send(JSON.stringify({
-            type: "chat",
-            message: JSON.stringify({
-                shape
-            }),
+            type: "shape",
+            shape: {
+                type,
+                data
+            },
             roomId
         }))
 
@@ -133,17 +147,17 @@ function clearCanvas(existingShapes: Shape[], canvas: HTMLCanvasElement, ctx: Ca
         }
     })
 }
-
 async function getExistingShapes(roomId: string) {
-    const res = await axios.get(`http://localhost:3001/chats/${roomId}`)
-    const messages = res.data.messages;
-
-    const shapes = messages.map((x: {message: string}) => {
-        const messageData = JSON.parse(x.message)
-        return messageData.shape;
-    })
-
-    return shapes;
+    const token = localStorage.getItem("token");
+    const res = await axios.get(`http://localhost:3001/shapes/${roomId}`, {
+        headers: {
+            Authorization: `Bearer ${token}`
+        }
+    });
+    const shapes:ShapeRow[] = res.data.shapes;
+    return shapes.map(s => ({
+        type:s.type,  ...s.data
+    }));
 }
 
 

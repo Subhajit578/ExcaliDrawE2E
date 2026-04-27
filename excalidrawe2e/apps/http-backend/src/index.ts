@@ -88,18 +88,18 @@ app.post("/room", isLoggedIn ,async (req,res) => {
 }
     
 })
-app.get("/chats/:roomId", async (req,res) => {
+app.get("/shapes/:roomId", isLoggedIn,  async (req,res) => {
     const roomId =  Number(req.params.roomId);
-    const messages = await prismaClient.chat.findMany({
+    const shapes = await prismaClient.shape.findMany({
         where : {
             roomId : roomId
         },
         orderBy : {
-            id: "desc"
+            id: "asc"
         },
         take : 1000
     })
-    res.send({messages : messages})
+    res.send({shapes : shapes})
 })
 app.listen(3001)
 

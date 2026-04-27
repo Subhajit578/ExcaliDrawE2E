@@ -61,30 +61,30 @@ wss.on("connection" , function(socket,request){
             if(!user){
                 return;
             }
-            user.rooms = user?.rooms.filter( x => x !== parsedData.room)
+            user.rooms = user?.rooms.filter( x => x !== parsedData.roomId)
         }
         console.log("message received")
         console.log(parsedData);
-        if(parsedData.type === "chat"){
+        if(parsedData.type === "shape"){
             const roomId = parsedData.roomId
-            const message = parsedData.message;
-            await prismaClient.chat.create({
-                data: {
+            const shape = parsedData.shape;
+            const created = await prismaClient.shape.create({
+                data : {
+                    type : shape.type,
+                    data: shape.data,
                     roomId: Number(roomId),
-                    message,
-                    userId
+                    userId,
                 }
             })
             users.forEach(user => {
                 if(user.rooms.includes(roomId)){
                     user.socket.send(JSON.stringify({
-                        type:"chat",
-                        message : message,
+                        type:"shape",
+                        shape: created,
                         roomId
                     }))
                 }
             })
         }
-
 })
 })

@@ -14,7 +14,7 @@ model User {
   password    String
   photo       String   
   rooms       Room[]
-  chat        Chat[]
+  shapes       Shape[]
 }
 model Room {
   id       Int @id@default(autoincrement())
@@ -22,15 +22,17 @@ model Room {
   adminId  String
   admin    User      @relation(fields: [adminId], references: [id])
   createdAt    DateTime @default(now())
-  chat      Chat[]
+  shapes    Shape[]
 }
 
 
-model Chat {
-  id         Int        @id @default(autoincrement())
-  message    String
-  roomId     Int
-  userId     String
-  user        User     @relation(fields:[userId], references: [id])
-  room        Room      @relation(fields:[roomId], references: [id])
+model Shape {
+  id        Int @id @default(autoincrement())
+  type      String
+  data      Json
+  roomId    Int
+  userId    String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+  room      Room     @relation(fields: [roomId], references: [id])
 }

@@ -11,23 +11,17 @@ export function Canvas ({roomId, socket} : {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const [game, setGame] = useState<Game>();
     const [selectedTool, setSelectedTool] = useState<Tool>("circle")
-
     useEffect(() => {
         game?.setTool(selectedTool);
     }, [selectedTool, game]);
-
     useEffect(() => {
-
         if (canvasRef.current) {
             const g = new Game(canvasRef.current, roomId, socket);
             setGame(g);
-
             return () => {
                 g.destroy();
             }
         }
-
-
     }, [canvasRef]);
     return <div style={{
         height: "100vh",
@@ -37,7 +31,6 @@ export function Canvas ({roomId, socket} : {
         <TopBar setSelectedTool={setSelectedTool} selectedTool={selectedTool} />
     </div>
 }
-
 function TopBar({selectedTool, setSelectedTool} : {
     selectedTool : Tool,
     setSelectedTool : (s:Tool) =>void
