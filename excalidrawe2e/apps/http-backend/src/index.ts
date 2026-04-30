@@ -88,18 +88,47 @@ app.post("/room", isLoggedIn ,async (req,res) => {
 }
     
 })
-app.get("/shapes/:roomId", isLoggedIn,  async (req,res) => {
-    const roomId =  Number(req.params.roomId);
-    const shapes = await prismaClient.shape.findMany({
-        where : {
-            roomId : roomId
-        },
-        orderBy : {
-            id: "asc"
-        },
-        take : 1000
-    })
-    res.send({shapes : shapes})
+//fetch room details using slugs
+app.get("/room/:slug", isLoggedIn, async(req , res) => {
+    const room = await prismaClient.room.findUnique({
+        where : { slug : req.params.slug}, 
+        select : {id:true, slug: true, admin: true, createdAt: true}
+    }); 
+    if(!room ) {
+        return res.status(404).send({err : "Error finding room"})
+    } else {
+        return res.send({room})
+    }
+})
+app.get("/shapes/:roomId" , isLoggedIn, async (req, res) => {
+    const roomId = Number(req.params.roomId)
+    if(Number.isNaN(roomId)) {
+        return res.status(404).send({message : "Invalid Room Id"})
+    } else {
+        try {
+            const shapes = await prismaClient.shape.findMany({
+                where : {roomId}, 
+                orderBy: {id : "asc"}
+            })
+            res.send({shapes})
+        } catch(err) {
+            return res.status(411).send({err : "Error Fetching content"})
+        }
+    }
+})
+app.get("/rooms", isLoggedIn, async(req, res) => {
+const userId = req.body.userId
+try {
+const rooms = await prismaClient.room.findMany({
+    where : {adminId : userId},
+    orderBy: {createdAt: "desc"}, 
+    select : {id:true, slug: true, createdAt:true}
+})
+res.send({rooms})
+} 
+catch(err) {
+    res.status(404).send({err : "Error finding user docs"})
+}
 })
 app.listen(3001)
 
