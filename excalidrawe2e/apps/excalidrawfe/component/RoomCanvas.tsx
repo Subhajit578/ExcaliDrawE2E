@@ -1,27 +1,45 @@
-"use client"
-import { initDraw } from "@/draw";
-import { useRef, useEffect,useState } from "react";
+"use client";
+import { useEffect, useState } from "react";
+import axios from "axios";
 import { Canvas } from "./Canvas";
 
-export function RoomCanvas({roomId} : {roomId : string}) { 
-    const [socket, setSocket] =  useState<WebSocket | null>(null);
-    useEffect(() => {
-        const ws = new WebSocket(`ws://localhost:8080/?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwNzNmOWJhMS1jNTE2LTQzNDItOTMyZC1kNWI5YzRlMmRhNmIiLCJ1c2VybmFtZSI6IlN1Ymhhaml0NyIsImlhdCI6MTc1ODQyNDE1M30.yzAtuam_kf4mWEfXTKiM-xK8WP7mUYQjxIH1QHLUG-8`);        
-        ws.onopen = () => {
-            setSocket(ws);
-            const data = JSON.stringify({
-                type: "join_room",
-                roomId
-            });
-            ws.send(data);
-        }
-    },[])
-    if(!socket ){
-        return <div>
-            Connecting to Server 
-        </div>
+export function RoomCanvas({ slug }: { slug: string }) {
+  const [roomId, setRoomId] = useState<number | null>(null);
+  const [socket, setSocket] = useState<WebSocket | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Resolve slug → id
+  useEffect(() => {
+    const token = localStorage.getItem("token");
+    if (!token) {
+      setError("Not signed in");
+      return;
     }
-    return <div>
-        <Canvas roomId = {roomId} socket = {socket}/>   
-    </div>
+    axios
+      .get(`http://localhost:3001/room/${slug}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      .then((res) => setRoomId(res.data.room.id))
+      .catch(() => setError("Room not found"));
+  }, [slug]);
+
+  // Open socket once we have the id
+  useEffect(() => {
+    if (roomId === null) return;
+    const token = localStorage.getItem("token");
+    const ws = new WebSocket(`ws://localhost:8080?token=${token}`);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "join_room", roomId: String(roomId) }));
+      setSocket(ws);
+    };
+
+    return () => ws.close();
+  }, [roomId]);
+
+  if (error) return <div className="p-8">{error}</div>;
+  if (roomId === null) return <div className="p-8">Loading canvas...</div>;
+  if (!socket) return <div className="p-8">Connecting to server...</div>;
+
+  return <Canvas roomId={String(roomId)} socket={socket} />;
 }

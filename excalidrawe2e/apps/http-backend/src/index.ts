@@ -81,7 +81,7 @@ app.post("/room", isLoggedIn ,async (req,res) => {
         }
     })
     res.send({
-        roomId : room.id
+        roomId : room.id, slug :room.slug
     })
 } catch (err){
     return res.json({message:"room already exist"})
@@ -92,8 +92,8 @@ app.post("/room", isLoggedIn ,async (req,res) => {
 app.get("/room/:slug", isLoggedIn, async(req , res) => {
     const room = await prismaClient.room.findUnique({
         where : { slug : req.params.slug}, 
-        select : {id:true, slug: true, admin: true, createdAt: true}
-    }); 
+        select : {id:true, slug: true, createdAt: true, admin:{select : {id: true , username :true}}}
+})
     if(!room ) {
         return res.status(404).send({err : "Error finding room"})
     } else {
@@ -117,7 +117,8 @@ app.get("/shapes/:roomId" , isLoggedIn, async (req, res) => {
     }
 })
 app.get("/rooms", isLoggedIn, async(req, res) => {
-const userId = req.body.userId
+    //@ts-ignore
+const userId = req.userId
 try {
 const rooms = await prismaClient.room.findMany({
     where : {adminId : userId},
@@ -130,6 +131,63 @@ catch(err) {
     res.status(404).send({err : "Error finding user docs"})
 }
 })
+app.delete("/room/:id" , isLoggedIn, async(req, res) => {
+    const id = Number(req.params.id)
+    //@ts-ignore
+    const userId = req.userId; 
+    try {
+    const room = await prismaClient.room.findUnique({where : {id}})
+    if(!room) return res.status(404).send({message : "Not found "})
+    else if(room.adminId !== userId) {
+        return res.status(403).send({message : "not ur room"})
+    } else {
+        try {
+            await prismaClient.shape.deleteMany({ where: { roomId: id } });
+            await prismaClient.room.delete({ where: { id } });
+        } catch (err) {
+            return res.send({message : "Error deleting Message "})
+        }
+    }
+    } catch (err) {
+console.log(err, err)
+res.status(500).send({error : err})
+}
+})
+app.patch("/room/:id", isLoggedIn, async (req, res) => {
+    const id = Number(req.params.id);            // ← convert
+    if (Number.isNaN(id)) {                       // ← now this check actually works
+      return res.status(400).send({ message: "Invalid id" });
+    }
+  
+    // @ts-ignore
+    const userId = req.userId;
+    const slug = req.body.slug;
+  
+    if (!slug || typeof slug !== "string") {
+      return res.status(400).send({ message: "Invalid Slug" });
+    }
+  
+    const room = await prismaClient.room.findUnique({ where: { id } });
+    if (!room) return res.status(404).send({ message: "Not found" });
+    if (room.adminId !== userId) {
+      return res.status(403).send({ message: "Not your room" });
+    }
+  
+    try {
+      const updated = await prismaClient.room.update({
+        where: { id },
+        data: { slug },
+        select: { id: true, slug: true },
+      });
+      res.send(updated);
+    } catch (err: any) {
+      if (err.code === "P2002") {
+        return res.status(409).send({ message: "Slug already taken" });
+      }
+      console.error(err);
+      res.status(500).send({ message: "Failed to rename" });
+    }
+  });
 app.listen(3001)
 
 

@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import { Eye, EyeOff, Mail, Lock, Sparkles } from 'lucide-react';
 import axios from 'axios'
+import {useRouter} from "next/navigation"
 export function AuthPage({ isSignin }: { isSignin: boolean }) {
     const [email, setEmail] = useState("");
     const [username, setUsername] = useState(""); // shown only on signup
@@ -10,18 +11,20 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
     const [isLoading, setIsLoading] = useState(false);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
     const [successMsg, setSuccessMsg] = useState<string | null>(null);
+    const router = useRouter()
     async function signIn() {
         const res = await axios.post("http://localhost:3001/signin",{
             email,password
         })
         const { token } =  res.data
         localStorage.setItem("token",token);
+        router.push("/dashboard")
     }
     async function signUp() {
         await axios.post("http://localhost:3001/signup",{
             email,username,password
         })
-        
+        router.push("/signin")
     }
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();

@@ -8,6 +8,7 @@ export function Canvas ({roomId, socket} : {
     roomId : string,
     socket :WebSocket
 }) {
+    const [size, setSize] = useState({w:0, h:0})
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const [game, setGame] = useState<Game>();
     const [selectedTool, setSelectedTool] = useState<Tool>("circle")
@@ -15,19 +16,22 @@ export function Canvas ({roomId, socket} : {
         game?.setTool(selectedTool);
     }, [selectedTool, game]);
     useEffect(() => {
-        if (canvasRef.current) {
-            const g = new Game(canvasRef.current, roomId, socket);
-            setGame(g);
-            return () => {
-                g.destroy();
-            }
-        }
-    }, [canvasRef]);
+        const update = () => setSize({ w: window.innerWidth, h: window.innerHeight });
+        update();
+        window.addEventListener("resize", update);
+        return () => window.removeEventListener("resize", update);
+      }, []);
+    useEffect(() => {
+        if (!canvasRef.current) return;
+        const g = new Game(canvasRef.current, roomId, socket);
+        setGame(g);
+        return () => g.destroy();
+      }, [roomId, socket]);
     return <div style={{
         height: "100vh",
         overflow: "hidden"
     }}>
-        <canvas ref={canvasRef} width={window.innerWidth} height={window.innerHeight}></canvas>
+        <canvas ref={canvasRef} width={size.w} height={size.h}></canvas>
         <TopBar setSelectedTool={setSelectedTool} selectedTool={selectedTool} />
     </div>
 }
@@ -40,7 +44,7 @@ function TopBar({selectedTool, setSelectedTool} : {
         top: 10,
         left: 10
     }}>
-        <div className="flex gap-t">
+        <div className="flex gap-2">
             <IconButton 
                 onClick={() => {
                     setSelectedTool("pencil")
