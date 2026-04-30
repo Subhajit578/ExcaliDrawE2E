@@ -52,19 +52,48 @@ wss.on("connection" , function(socket,request){
           } else {
             parsedData = JSON.parse(data); // {type: "join-room", roomId: 1}
           }
+
+        console.log("message received")
+        console.log(parsedData);
+
         if(parsedData.type === "join_room"){
             const user = users.find(x => x.socket === socket)
             user?.rooms.push(parsedData.roomId);
+            return;
         }
+
         if(parsedData.type === "leave_room"){
             const user = users.find(x => x.socket === socket)
             if(!user){
                 return;
             }
             user.rooms = user?.rooms.filter( x => x !== parsedData.roomId)
+            return;
         }
-        console.log("message received")
-        console.log(parsedData);
+
+        if (parsedData.type === "stroke_start" || parsedData.type === "stroke_point") {
+            const roomId = parsedData.roomId;
+            users.forEach(u => {
+              if (u.rooms.includes(roomId) && u.socket !== socket) {
+                u.socket.send(JSON.stringify(parsedData));
+              }
+            });
+            return;
+        }
+
+        if (parsedData.type === "clear_room") {
+            const roomId = parsedData.roomId;
+            await prismaClient.shape.deleteMany({
+              where: { roomId: Number(roomId) },
+            });
+            users.forEach((u) => {
+              if (u.rooms.includes(roomId)) {
+                u.socket.send(JSON.stringify({ type: "clear_room", roomId }));
+              }
+            });
+            return;
+        }
+
         if(parsedData.type === "shape"){
             const roomId = parsedData.roomId
             const shape = parsedData.shape;
@@ -85,6 +114,7 @@ wss.on("connection" , function(socket,request){
                     }))
                 }
             })
+            return;
         }
 })
 })
