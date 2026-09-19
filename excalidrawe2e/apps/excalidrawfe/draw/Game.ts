@@ -1,6 +1,7 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
+import { ShapeRenderer } from "./renderer";
 
 type Shape =
   | { type: "rect"; x: number; y: number; width: number; height: number; color: string; id: string }
@@ -27,6 +28,7 @@ function newId(): string {
 export class Game {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private renderer: ShapeRenderer;
   private existingShapes: Shape[];
   private roomId: string;
   private clicked: boolean;
@@ -55,6 +57,7 @@ export class Game {
   ) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
+    this.renderer = new ShapeRenderer(this.ctx);
     this.existingShapes = [];
     this.roomId = roomId;
     this.socket = socket;
@@ -171,57 +174,25 @@ export class Game {
     };
   }
 
-  private drawStroke(
-    points: { x: number; y: number }[],
-    color: string = this.currentColor
-  ) {
-    if (points.length < 2) return;
-    this.ctx.strokeStyle = this.paintColor(color);
-    this.ctx.lineWidth = 2;
-    this.ctx.lineCap = "round";
-    this.ctx.lineJoin = "round";
-    this.ctx.beginPath();
-    this.ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      this.ctx.lineTo(points[i].x, points[i].y);
-    }
-    this.ctx.stroke();
-  }
-
   clearCanvas() {
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.fillStyle = THEMES[this.theme].canvas;
-    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.renderer.clear(THEMES[this.theme].canvas);
 
     this.existingShapes.map((shape) => {
       // stored colours are palette names now, but old rows hold raw hex
       const color = this.paintColor(shape.color);
 
       if (shape.type === "rect") {
-        this.ctx.strokeStyle = color;
-        this.ctx.lineWidth = 1;
-        this.ctx.strokeRect(shape.x, shape.y, shape.width, shape.height);
+        this.renderer.rect(shape.x, shape.y, shape.width, shape.height, color);
       } else if (shape.type === "circle") {
-        this.ctx.strokeStyle = color;
-        this.ctx.lineWidth = 1;
-        this.ctx.beginPath();
-        this.ctx.arc(
-          shape.centerX,
-          shape.centerY,
-          Math.abs(shape.radius),
-          0,
-          Math.PI * 2
-        );
-        this.ctx.stroke();
-        this.ctx.closePath();
+        this.renderer.circle(shape.centerX, shape.centerY, shape.radius, color);
       } else if (shape.type === "pencil") {
-        this.drawStroke(shape.points, color);
+        this.renderer.stroke(shape.points, color);
       }
     });
 
     // render in-progress strokes from other users on top, in *their* color
     this.remoteStrokes.forEach((stroke) => {
-      this.drawStroke(stroke.points, stroke.color);
+      this.renderer.stroke(stroke.points, this.paintColor(stroke.color));
     });
   }
 
@@ -321,19 +292,21 @@ export class Game {
       const width = e.clientX - this.startX;
       const height = e.clientY - this.startY;
       this.clearCanvas();
-      this.ctx.strokeStyle = this.paintColor(this.currentColor);
+      // the preview goes through the same renderer as saved shapes, so the two
+      // cannot look different
+      const color = this.paintColor(this.currentColor);
       const selectedTool = this.selectedTool;
 
       if (selectedTool === "rect") {
-        this.ctx.strokeRect(this.startX, this.startY, width, height);
+        this.renderer.rect(this.startX, this.startY, width, height, color);
       } else if (selectedTool === "circle") {
         const radius = Math.max(width, height) / 2;
-        const centerX = this.startX + radius;
-        const centerY = this.startY + radius;
-        this.ctx.beginPath();
-        this.ctx.arc(centerX, centerY, Math.abs(radius), 0, Math.PI * 2);
-        this.ctx.stroke();
-        this.ctx.closePath();
+        this.renderer.circle(
+          this.startX + radius,
+          this.startY + radius,
+          radius,
+          color
+        );
       } else if (selectedTool === "pencil" && this.currentStrokeId) {
         const point = { x: e.clientX, y: e.clientY };
         this.currentStroke.push(point);
@@ -345,7 +318,7 @@ export class Game {
             roomId: this.roomId,
           })
         );
-        this.drawStroke(this.currentStroke);
+        this.renderer.stroke(this.currentStroke, color);
       }
     }
   };
