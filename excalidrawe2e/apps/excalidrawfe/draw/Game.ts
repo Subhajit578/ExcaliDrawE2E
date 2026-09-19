@@ -2,9 +2,26 @@ import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
 
 type Shape =
-  | { type: "rect"; x: number; y: number; width: number; height: number; color: string }
-  | { type: "circle"; centerX: number; centerY: number; radius: number; color: string }
-  | { type: "pencil"; points: { x: number; y: number }[]; color: string };
+  | { type: "rect"; x: number; y: number; width: number; height: number; color: string; id: string }
+  | { type: "circle"; centerX: number; centerY: number; radius: number; color: string; id: string  }
+  | { type: "pencil"; points: { x: number; y: number }[]; color: string; id: string  };
+
+// a stroke someone else is drawing right now: kept until their finished shape arrives
+type RemoteStroke = { color: string; points: { x: number; y: number }[] };
+
+// crypto.randomUUID() only exists in a secure context, so it is undefined when the
+// app is opened over plain http on a LAN address. getRandomValues works everywhere.
+function newId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 export class Game {
   private canvas: HTMLCanvasElement;
@@ -20,7 +37,10 @@ export class Game {
   // pencil state
   private currentStroke: { x: number; y: number }[] = [];
   private currentStrokeId: string | null = null;
-  private remoteStrokes: Map<string, { x: number; y: number }[]> = new Map();
+  private remoteStrokes: Map<string, RemoteStroke> = new Map();
+
+  // every shape id we already hold, so an echo of our own shape is a no-op
+  private shapeIds: Set<string> = new Set();
 
   socket: WebSocket;
 
@@ -60,40 +80,64 @@ export class Game {
   }
 
   async init() {
-    this.existingShapes = await getExistingShapes(this.roomId);
-    console.log(this.existingShapes);
-    this.clearCanvas();
+    try {
+      this.existingShapes = await getExistingShapes(this.roomId);
+      this.shapeIds = new Set(this.existingShapes.map((s) => s.id));
+      this.clearCanvas();
+    } catch (err) {
+      console.error("[canvas] could not load existing shapes:", err);
+    }
   }
 
   initHandlers() {
     this.socket.onmessage = (event) => {
-      const message = JSON.parse(event.data);
+      try {
+        const message = JSON.parse(event.data);
 
-      if (message.type === "shape") {
-        const incomingShape = message.shape;
-        if (!incomingShape?.type || !incomingShape?.data) {
-          return;
-        }
-        this.existingShapes.push({
-          type: incomingShape.type,
-          ...incomingShape.data,
-        } as Shape);
-        if (message.strokeId) {
-          this.remoteStrokes.delete(message.strokeId);
-        }
-        this.clearCanvas();
-      } else if (message.type === "stroke_start") {
-        this.remoteStrokes.set(message.strokeId, []);
-      } else if (message.type === "stroke_point") {
-        const stroke = this.remoteStrokes.get(message.strokeId);
-        if (stroke) {
-          stroke.push(message.point);
+        if (message.type === "shape") {
+          const incomingShape = message.shape;
+          if (!incomingShape?.type || !incomingShape?.data) {
+            return;
+          }
+          const id: string | undefined = incomingShape.id ?? message.id;
+
+          // our own shape coming back (or a resend): we already have it, so
+          // adding it again would leave two copies of one shape in the array
+          if (!id || !this.shapeIds.has(id)) {
+            if (id) this.shapeIds.add(id);
+            this.existingShapes.push({
+              id,
+              type: incomingShape.type,
+              ...incomingShape.data,
+            } as Shape);
+          }
+
+          // the finished shape replaces the live preview of the same stroke
+          if (message.strokeId) {
+            this.remoteStrokes.delete(message.strokeId);
+          }
           this.clearCanvas();
+        } else if (message.type === "stroke_start") {
+          this.remoteStrokes.set(message.strokeId, {
+            color: message.color || "#ffffff",
+            points: [],
+          });
+        } else if (message.type === "stroke_point") {
+          const stroke = this.remoteStrokes.get(message.strokeId);
+          if (stroke) {
+            stroke.points.push(message.point);
+            this.clearCanvas();
+          }
+        } else if (message.type === "clear_room") {
+          this.existingShapes = [];
+          this.shapeIds.clear();
+          this.remoteStrokes.clear();
+          this.clearCanvas();
+        } else if (message.type === "error") {
+          console.error("[canvas] server rejected a message:", message.message);
         }
-      } else if (message.type === "clear_room") {
-        this.existingShapes = [];
-        this.remoteStrokes.clear();
-        this.clearCanvas();
+      } catch (err) {
+        console.error("[canvas] bad message from server:", err);
       }
     };
   }
@@ -146,9 +190,9 @@ export class Game {
       }
     });
 
-    // render in-progress strokes from other users on top
-    this.remoteStrokes.forEach((points) => {
-      this.drawStroke(points);
+    // render in-progress strokes from other users on top, in *their* color
+    this.remoteStrokes.forEach((stroke) => {
+      this.drawStroke(stroke.points, stroke.color);
     });
   }
 
@@ -158,12 +202,13 @@ export class Game {
     this.startY = e.clientY;
 
     if (this.selectedTool === "pencil") {
-      this.currentStrokeId = crypto.randomUUID();
+      this.currentStrokeId = newId();
       this.currentStroke = [{ x: e.clientX, y: e.clientY }];
       this.socket.send(
         JSON.stringify({
           type: "stroke_start",
           strokeId: this.currentStrokeId,
+          color: this.currentColor,
           roomId: this.roomId,
         })
       );
@@ -176,10 +221,13 @@ export class Game {
     const height = e.clientY - this.startY;
 
     const selectedTool = this.selectedTool;
+    // the client names the shape, so the echo of it is recognisable as our own
+    const id = newId();
     let shape: Shape | null = null;
 
     if (selectedTool === "rect") {
       shape = {
+        id,
         type: "rect",
         x: this.startX,
         y: this.startY,
@@ -190,6 +238,7 @@ export class Game {
     } else if (selectedTool === "circle") {
       const radius = Math.max(width, height) / 2;
       shape = {
+        id,
         type: "circle",
         radius: radius,
         centerX: this.startX + radius,
@@ -203,6 +252,7 @@ export class Game {
         return;
       }
       shape = {
+        id,
         type: "pencil",
         points: this.currentStroke,
         color: this.currentColor,
@@ -214,11 +264,15 @@ export class Game {
     }
 
     this.existingShapes.push(shape);
-    const { type, ...data } = shape;
+    this.shapeIds.add(id);
+    // id travels at the top level: it is identity, not geometry, so it stays
+    // out of the JSON column that `data` becomes
+    const { type, id: _id, ...data } = shape;
 
     this.socket.send(
       JSON.stringify({
         type: "shape",
+        id,
         shape: {
           type,
           data,

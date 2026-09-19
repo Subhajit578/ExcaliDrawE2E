@@ -46,6 +46,9 @@ wss.on("connection" , function(socket,request){
         if (i !== -1) users.splice(i, 1);
       });
     socket.on('message',async function message(data ){
+      // one guard around the whole handler: a bad frame, a rejected query or a
+      // sleeping database must not take the process down for everyone
+      try {
         let parsedData
         if (typeof data !== "string") {
             parsedData = JSON.parse(data.toString());
@@ -97,24 +100,57 @@ wss.on("connection" , function(socket,request){
         if(parsedData.type === "shape"){
             const roomId = parsedData.roomId
             const shape = parsedData.shape;
-            const created = await prismaClient.shape.create({
-                data : {
+            const id = parsedData.id ?? shape?.id;
+
+            // the client names its own shapes now, so this is untrusted input
+            if (typeof id !== "string" || id.length === 0 || id.length > 100) {
+                socket.send(JSON.stringify({
+                    type: "error",
+                    message: "Shape is missing a valid id",
+                    strokeId: parsedData.strokeId ?? null,
+                }));
+                return;
+            }
+
+            // upsert, not create: a resend of the same id is a no-op instead of a
+            // unique-constraint error. `update` stays empty on purpose - editing a
+            // shape belongs to a future update_shape message that carries its own
+            // ownership check.
+            const created = await prismaClient.shape.upsert({
+                where: { id },
+                create: {
+                    id,
                     type : shape.type,
                     data: shape.data,
                     roomId: Number(roomId),
                     userId,
-                }
+                },
+                update: {},
             })
             users.forEach(user => {
                 if(user.rooms.includes(roomId)){
                     user.socket.send(JSON.stringify({
                         type:"shape",
                         shape: created,
+                        // relayed back so receivers can drop the live preview of
+                        // this stroke; without it the preview never clears
+                        strokeId: parsedData.strokeId ?? null,
                         roomId
                     }))
                 }
             })
             return;
         }
+      } catch (err) {
+        console.error("[WS] failed to handle message:", err);
+        try {
+          socket.send(JSON.stringify({
+            type: "error",
+            message: "Could not process that message",
+          }));
+        } catch {
+          // socket already gone; nothing to report to
+        }
+      }
 })
 })

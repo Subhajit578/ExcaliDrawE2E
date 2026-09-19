@@ -41,7 +41,7 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
           }
           // TODO: navigate to dashboard, etc.
         } catch (err: any) {
-          setErrorMsg(err?.message ?? "Something went wrong");
+          setErrorMsg(err?.response?.data?.message ?? err?.message ?? "Something went wrong");
         } finally {
           setIsLoading(false);
         }
@@ -84,7 +84,7 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       placeholder="Enter your email"
-                      className="w-full pl-12 pr-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors duration-200 bg-gray-50/50 backdrop-blur-sm"
+                      className="w-full pl-12 pr-4 py-3 border placeholder:text-gray-500  border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors duration-200 bg-gray-50/50 backdrop-blur-none"
                       required
                     />
                   </div>
@@ -188,7 +188,7 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
     
               {/* Switch Mode Button (wire to your router later) */}
               <div className="mt-6 text-center">
-                <button type="button" className="text-indigo-600 hover:text-indigo-700 font-medium transition-colors">
+                <button type="button" className="text-indigo-600 hover:text-indigo-700 font-medium transition-colors" onClick={() => {router.push(isSignin ? "/signup" : "/signin")}}>
                   {isSignin ? "Create a new account" : "Sign in instead"}
                 </button>
               </div>

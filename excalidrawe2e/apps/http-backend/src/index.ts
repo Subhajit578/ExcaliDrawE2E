@@ -31,9 +31,9 @@ app.post("/signup", async (req,res) => {
                 photo : ""
             },
         })
-        res.status(200).send({message:"User created "})
+        res.status(200).send({message:"User created"})
     } catch (err){
-        res.status(400).send({message: "Error creating user"})
+        res.status(400).send({message: err})
     }
     }
 }) 
@@ -108,7 +108,7 @@ app.get("/shapes/:roomId" , isLoggedIn, async (req, res) => {
         try {
             const shapes = await prismaClient.shape.findMany({
                 where : {roomId}, 
-                orderBy: {id : "asc"}
+                orderBy: {createdAt : "asc"}
             })
             res.send({shapes})
         } catch(err) {

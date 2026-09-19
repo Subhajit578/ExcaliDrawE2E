@@ -125,7 +125,6 @@ export function Dashboard() {
           room.id === renameTarget.id ? { ...room, slug: res.data.slug } : room
         )
       );
-      console.log("[rename] new state", next);
       setRenameTarget(null);
       setRenameSlug("");
     } catch (err: any) {

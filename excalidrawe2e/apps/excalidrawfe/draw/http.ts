@@ -1,8 +1,8 @@
 import axios from "axios";
 type ShapeRow = {
-    id: number;
+    id: string;
     type: string;
-    data: any; 
+    data: any;
     roomId: number;
     userId: string;
   };
@@ -14,7 +14,9 @@ export async function getExistingShapes(roomId: string) {
     const shapes:ShapeRow[] = res.data.shapes;
 
 
+    // keep the id: it is how we recognise our own shapes coming back to us,
+    // and what delete/move will address in a later step
     return shapes.map(s => ({
-        type:s.type,  ...s.data
+        id: s.id, type:s.type,  ...s.data
     }));
 }
