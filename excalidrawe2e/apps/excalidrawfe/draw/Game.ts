@@ -1,15 +1,20 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
-import { ShapeRenderer } from "./renderer";
+import { ShapeRenderer, type Point } from "./renderer";
+import { elbowPoints } from "./routing";
 
 type Shape =
   | { type: "rect"; x: number; y: number; width: number; height: number; color: string; id: string }
   | { type: "circle"; centerX: number; centerY: number; radius: number; color: string; id: string  }
-  | { type: "pencil"; points: { x: number; y: number }[]; color: string; id: string  };
+  | { type: "pencil"; points: Point[]; color: string; id: string  }
+  // line and arrow are polylines: two points for a straight run, three for an
+  // elbow. Identical shapes, so one is convertible to the other later.
+  | { type: "line"; points: Point[]; color: string; id: string }
+  | { type: "arrow"; points: Point[]; color: string; id: string };
 
 // a stroke someone else is drawing right now: kept until their finished shape arrives
-type RemoteStroke = { color: string; points: { x: number; y: number }[] };
+type RemoteStroke = { color: string; points: Point[] };
 
 // crypto.randomUUID() only exists in a secure context, so it is undefined when the
 // app is opened over plain http on a LAN address. getRandomValues works everywhere.
@@ -74,7 +79,7 @@ export class Game {
     this.canvas.removeEventListener("mousemove", this.mouseMoveHandler);
   }
 
-  setTool(tool: "circle" | "pencil" | "rect") {
+  setTool(tool: Tool) {
     this.selectedTool = tool;
   }
 
@@ -187,6 +192,10 @@ export class Game {
         this.renderer.circle(shape.centerX, shape.centerY, shape.radius, color);
       } else if (shape.type === "pencil") {
         this.renderer.stroke(shape.points, color);
+      } else if (shape.type === "line") {
+        this.renderer.polyline(shape.points, color);
+      } else if (shape.type === "arrow") {
+        this.renderer.arrow(shape.points, color);
       }
     });
 
@@ -223,6 +232,8 @@ export class Game {
     const selectedTool = this.selectedTool;
     // the client names the shape, so the echo of it is recognisable as our own
     const id = newId();
+    const start = { x: this.startX, y: this.startY };
+    const end = { x: e.clientX, y: e.clientY };
     let shape: Shape | null = null;
 
     if (selectedTool === "rect") {
@@ -255,6 +266,25 @@ export class Game {
         id,
         type: "pencil",
         points: this.currentStroke,
+        color: this.currentColor,
+      };
+    } else if (selectedTool === "line") {
+      // a click with no drag would store a zero-length shape: invisible, and
+      // nearly impossible to erase later
+      if (Math.hypot(width, height) < 4) return;
+      shape = {
+        id,
+        type: "line",
+        points: [start, end],
+        color: this.currentColor,
+      };
+    } else if (selectedTool === "arrow") {
+      if (Math.hypot(width, height) < 4) return;
+      shape = {
+        id,
+        type: "arrow",
+        // the same router the preview used, so what is saved is what was shown
+        points: elbowPoints(start, end),
         color: this.currentColor,
       };
     }
@@ -319,6 +349,19 @@ export class Game {
           })
         );
         this.renderer.stroke(this.currentStroke, color);
+      } else if (selectedTool === "line") {
+        this.renderer.polyline(
+          [{ x: this.startX, y: this.startY }, { x: e.clientX, y: e.clientY }],
+          color
+        );
+      } else if (selectedTool === "arrow") {
+        this.renderer.arrow(
+          elbowPoints(
+            { x: this.startX, y: this.startY },
+            { x: e.clientX, y: e.clientY }
+          ),
+          color
+        );
       }
     }
   };

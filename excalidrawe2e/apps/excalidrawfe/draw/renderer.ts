@@ -1,6 +1,12 @@
 export type Point = { x: number; y: number };
 
 /**
+ * How much to round an elbow corner. Applies to lines and arrow shafts only -
+ * pencil strokes keep their exact points, since rounding a hand-drawn path
+ * would smooth away what the person actually drew.
+ */
+const CORNER_RADIUS = 12;
+/**
  * Every drawing primitive, in one place.
  *
  * Saved shapes and live previews both go through here, so the two can no longer
@@ -33,7 +39,21 @@ export class ShapeRenderer {
   rect(x: number, y: number, width: number, height: number, color: string) {
     this.ctx.strokeStyle = color;
     this.ctx.lineWidth = 1;
-    this.ctx.strokeRect(x, y, width, height);
+
+    // dragging right-to-left or upwards gives negative sizes, so normalise to a
+    // top-left origin before the corner maths
+    const left = width < 0 ? x + width : x;
+    const top = height < 0 ? y + height : y;
+    const w = Math.abs(width);
+    const h = Math.abs(height);
+
+    // a corner cannot round past half the shorter side, or the arcs meet and
+    // the rectangle turns into a lozenge
+    const radius = Math.min(CORNER_RADIUS, w / 2, h / 2);
+
+    this.ctx.beginPath();
+    this.ctx.roundRect(left, top, w, h, radius);
+    this.ctx.stroke();
   }
 
   circle(centerX: number, centerY: number, radius: number, color: string) {
@@ -44,18 +64,71 @@ export class ShapeRenderer {
     this.ctx.stroke();
     this.ctx.closePath();
   }
+  arrow(points: Point[], color: string) {
+    if (points.length < 2) return;
+    this.polyline(points, color);
+    this.arrowhead(points[points.length - 2], points[points.length - 1], color);
+  }
+  stroke(points: Point[], color: string) { 
+    this.path(points, color, 2); 
+  }
 
-  stroke(points: Point[], color: string) {
+  private path(
+    points: Point[],
+    color: string,
+    width: number,
+    cornerRadius = 0
+  ) {
     if (points.length < 2) return;
     this.ctx.strokeStyle = color;
-    this.ctx.lineWidth = 2;
+    this.ctx.lineWidth = width;
     this.ctx.lineCap = "round";
     this.ctx.lineJoin = "round";
     this.ctx.beginPath();
     this.ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      this.ctx.lineTo(points[i].x, points[i].y);
+
+    if (cornerRadius > 0 && points.length > 2) {
+      // arcTo draws toward the corner, then curves away along the next segment.
+      // Only the vertices in the middle are corners; the two ends stay square.
+      for (let i = 1; i < points.length - 1; i++) {
+        const prev = points[i - 1]!;
+        const corner = points[i]!;
+        const next = points[i + 1]!;
+        // a corner cannot round further than half of either leg, or the two
+        // arcs of a short segment would overlap and bulge
+        const radius = Math.min(
+          cornerRadius,
+          Math.hypot(corner.x - prev.x, corner.y - prev.y) / 2,
+          Math.hypot(next.x - corner.x, next.y - corner.y) / 2
+        );
+        this.ctx.arcTo(corner.x, corner.y, next.x, next.y, radius);
+      }
+      const last = points[points.length - 1]!;
+      // arcTo stops where the curve leaves the corner, so close the final run
+      this.ctx.lineTo(last.x, last.y);
+    } else {
+      for (let i = 1; i < points.length; i++) {
+        this.ctx.lineTo(points[i].x, points[i].y);
+      }
     }
+
+    this.ctx.stroke();
+  }
+  polyline(points: Point[], color: string) {
+    this.path(points, color, 1, CORNER_RADIUS);
+  }
+  private arrowhead(pointFrom: Point, pointTo: Point, color: string) {
+    this.ctx.strokeStyle = color;
+    this.ctx.lineWidth = 1;
+    this.ctx.beginPath();
+    var dx = pointTo.x - pointFrom.x;
+    var dy = pointTo.y - pointFrom.y; 
+    var angle = Math.atan2(dy, dx);
+    var headlen =10;
+    this.ctx.moveTo(pointTo.x, pointTo.y); 
+    this.ctx.lineTo(pointTo.x - headlen * Math.cos(angle - Math.PI / 6), pointTo.y - headlen * Math.sin(angle - Math.PI / 6));
+    this.ctx.moveTo(pointTo.x, pointTo.y);
+    this.ctx.lineTo(pointTo.x - headlen * Math.cos(angle + Math.PI / 6), pointTo.y - headlen * Math.sin(angle + Math.PI / 6));
     this.ctx.stroke();
   }
 }
