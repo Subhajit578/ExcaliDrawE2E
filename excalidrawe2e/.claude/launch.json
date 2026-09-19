@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "excalidrawfe",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "excalidrawfe", "dev"],
+      "port": 3000
+    }
+  ]
+}

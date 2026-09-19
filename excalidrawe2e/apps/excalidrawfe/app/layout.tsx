@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { ThemeProvider } from "@/component/ThemeProvider";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -23,11 +24,21 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Applies a saved theme override before first paint, so the canvas never
+            flashes the wrong theme. No saved value means the browser preference
+            stays in charge. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `try{var c=localStorage.getItem('excalidraw-theme');if(c==='light'||c==='dark'){document.documentElement.setAttribute('data-theme',c);document.documentElement.style.colorScheme=c;}}catch(e){}`,
+          }}
+        />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        {children}
+        <ThemeProvider>{children}</ThemeProvider>
       </body>
     </html>
   );

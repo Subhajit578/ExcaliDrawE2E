@@ -1,5 +1,6 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
+import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 
 type Shape =
   | { type: "rect"; x: number; y: number; width: number; height: number; color: string; id: string }
@@ -32,7 +33,9 @@ export class Game {
   private startX = 0;
   private startY = 0;
   private selectedTool: Tool = "circle";
-  private currentColor: string = "#ffffff";
+  // a palette name, not a hex: what it looks like is decided at paint time
+  private currentColor: string = DEFAULT_COLOR;
+  private theme: ThemeName = "dark";
 
   // pencil state
   private currentStroke: { x: number; y: number }[] = [];
@@ -44,13 +47,19 @@ export class Game {
 
   socket: WebSocket;
 
-  constructor(canvas: HTMLCanvasElement, roomId: string, socket: WebSocket) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    roomId: string,
+    socket: WebSocket,
+    theme: ThemeName = "dark"
+  ) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
     this.existingShapes = [];
     this.roomId = roomId;
     this.socket = socket;
     this.clicked = false;
+    this.theme = theme;
     this.init();
     this.initHandlers();
     this.initMouseHandlers();
@@ -68,6 +77,26 @@ export class Game {
 
   setColor(color: string) {
     this.currentColor = color;
+  }
+
+  setTheme(theme: ThemeName) {
+    if (this.theme === theme) return;
+    this.theme = theme;
+    this.repaint();
+  }
+
+  /**
+   * Repaint from the shape list. Needed whenever something outside the drawing
+   * loop invalidates the canvas: a theme change, or a resize - setting a
+   * canvas's width or height wipes its contents.
+   */
+  repaint() {
+    this.clearCanvas();
+  }
+
+  /** what to actually stroke with, given a stored colour and the current theme */
+  private paintColor(stored?: string) {
+    return resolveColor(stored, this.theme);
   }
 
   clearRoom() {
@@ -147,7 +176,7 @@ export class Game {
     color: string = this.currentColor
   ) {
     if (points.length < 2) return;
-    this.ctx.strokeStyle = color;
+    this.ctx.strokeStyle = this.paintColor(color);
     this.ctx.lineWidth = 2;
     this.ctx.lineCap = "round";
     this.ctx.lineJoin = "round";
@@ -161,12 +190,12 @@ export class Game {
 
   clearCanvas() {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.fillStyle = "rgba(0, 0, 0)";
+    this.ctx.fillStyle = THEMES[this.theme].canvas;
     this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     this.existingShapes.map((shape) => {
-      // fallback to white for any pre-color-update shapes still in the DB
-      const color = shape.color || "#ffffff";
+      // stored colours are palette names now, but old rows hold raw hex
+      const color = this.paintColor(shape.color);
 
       if (shape.type === "rect") {
         this.ctx.strokeStyle = color;
@@ -292,7 +321,7 @@ export class Game {
       const width = e.clientX - this.startX;
       const height = e.clientY - this.startY;
       this.clearCanvas();
-      this.ctx.strokeStyle = this.currentColor;
+      this.ctx.strokeStyle = this.paintColor(this.currentColor);
       const selectedTool = this.selectedTool;
 
       if (selectedTool === "rect") {
