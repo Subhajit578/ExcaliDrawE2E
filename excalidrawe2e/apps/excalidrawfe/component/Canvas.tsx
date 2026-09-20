@@ -9,8 +9,9 @@ import {
   RectangleHorizontalIcon,
   Sun,
   Trash2,
-  Minus, 
-  MoveUpRight
+  Minus,
+  MoveUpRight,
+  Type
 } from "lucide-react";
 import { Game } from "@/draw/Game";
 import { useTheme } from "./ThemeProvider";
@@ -22,7 +23,7 @@ import {
   type ThemeChoice,
 } from "@/draw/theme";
 
-export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow";
+export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text";
 
 export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }) {
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -180,6 +181,13 @@ function TopBar({
           activated={selectedTool === "arrow"}
           icon={<MoveUpRight size={20} />}
           title="Arrow"
+          {...iconProps}
+        />
+        <IconButton
+          onClick={() => setSelectedTool("text")}
+          activated={selectedTool === "text"}
+          icon={<Type size={20} />}
+          title="Text"
           {...iconProps}
         />
       </div>

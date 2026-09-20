@@ -6,6 +6,30 @@ export type Point = { x: number; y: number };
  * would smooth away what the person actually drew.
  */
 const CORNER_RADIUS = 12;
+
+/**
+ * Gap between lines of a text shape, as a multiple of its font size.
+ *
+ * Exported because the editor overlay has to use the same value: if the
+ * textarea's line-height differs from this, the text jumps the moment it is
+ * committed to the canvas.
+ */
+export const LINE_HEIGHT = 1.25;
+
+/** Size new text is created at, until there is a size picker in the toolbar. */
+export const DEFAULT_FONT_SIZE = 20;
+
+/**
+ * Family new text is created with.
+ *
+ * A system stack rather than the app's Geist: ctx.font cannot read a CSS
+ * variable, and a webfont that has not finished loading paints with fallback
+ * metrics, so text drawn early would shift position once the real font arrives.
+ * Moving to Geist later means resolving the family and repainting on
+ * document.fonts.ready.
+ */
+export const DEFAULT_FONT_FAMILY =
+  'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 /**
  * Every drawing primitive, in one place.
  *
@@ -69,8 +93,37 @@ export class ShapeRenderer {
     this.polyline(points, color);
     this.arrowhead(points[points.length - 2], points[points.length - 1], color);
   }
-  stroke(points: Point[], color: string) { 
-    this.path(points, color, 2); 
+  stroke(points: Point[], color: string) {
+    this.path(points, color, 2);
+  }
+
+  /**
+   * Draw a text shape. `x` and `y` are the top-left of the first line, which is
+   * what the editor overlay positions itself at - keeping the two in the same
+   * coordinate space is why textBaseline is "top" rather than the canvas
+   * default of "alphabetic".
+   *
+   * fillText ignores "\n" completely, so lines are split here.
+   */
+  text(
+    x: number,
+    y: number,
+    content: string,
+    color: string,
+    fontSize: number,
+    fontFamily: string
+  ) {
+    // text is filled, not stroked - and clear() leaves fillStyle on the board
+    // colour, so an unset fillStyle paints text invisibly
+    this.ctx.fillStyle = color;
+    this.ctx.font = `${fontSize}px ${fontFamily}`;
+    this.ctx.textBaseline = "top";
+    this.ctx.textAlign = "left";
+
+    const lineHeight = fontSize * LINE_HEIGHT;
+    content.split("\n").forEach((line, index) => {
+      this.ctx.fillText(line, x, y + index * lineHeight);
+    });
   }
 
   private path(
