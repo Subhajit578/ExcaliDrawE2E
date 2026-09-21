@@ -14,6 +14,12 @@ import {
   Type
 } from "lucide-react";
 import { Game } from "@/draw/Game";
+import TextOverlay from "./TextOverlay";
+import {
+  DEFAULT_FONT_FAMILY,
+  DEFAULT_FONT_SIZE,
+  type Point,
+} from "@/draw/renderer";
 import { useTheme } from "./ThemeProvider";
 import {
   COLOR_NAMES,
@@ -32,6 +38,8 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   const [selectedTool, setSelectedTool] = useState<Tool>("circle");
   // a palette name; the theme decides what it looks like
   const [selectedColor, setSelectedColor] = useState<ColorName>(DEFAULT_COLOR);
+  // where the text editor is open, or null when there isn't one
+  const [editing, setEditing] = useState<Point | null>(null);
   const { theme, choice, cycle } = useTheme();
   const palette = THEMES[theme];
 
@@ -46,6 +54,10 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   useEffect(() => {
     game?.setTheme(theme);
   }, [theme, game]);
+
+  useEffect(() => {
+    game?.setOnTextRequest((at) => setEditing(at));
+  }, [game]);
 
   useEffect(() => {
     const update = () => setSize({ w: window.innerWidth, h: window.innerHeight });
@@ -85,6 +97,26 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
       }}
     >
       <canvas ref={canvasRef} width={size.w} height={size.h} />
+
+      {/* key: a second double click elsewhere gets a fresh editor rather than
+          one still holding the previous text in its own state */}
+      {editing && (
+        <TextOverlay
+          key={`${editing.x}-${editing.y}`}
+          at={editing}
+          color={palette.colors[selectedColor]}
+          fontSize={DEFAULT_FONT_SIZE}
+          fontFamily={DEFAULT_FONT_FAMILY}
+          onCommit={(value) => {
+            // STEP 6 goes here: replace this log with
+            // game?.addText(editing, value.trim(), DEFAULT_FONT_SIZE, DEFAULT_FONT_FAMILY);
+            game?.addText(editing, value.trim(), DEFAULT_FONT_SIZE, DEFAULT_FONT_FAMILY);
+            setEditing(null);
+          }}
+          onCancel={() => setEditing(null)}
+        />
+      )}
+
       <TopBar
         selectedTool={selectedTool}
         setSelectedTool={setSelectedTool}

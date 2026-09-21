@@ -144,6 +144,7 @@ export class Game {
     this.canvas.removeEventListener("mousedown", this.mouseDownHandler);
     this.canvas.removeEventListener("mouseup", this.mouseUpHandler);
     this.canvas.removeEventListener("mousemove", this.mouseMoveHandler);
+    this.canvas.removeEventListener("dblclick", this.dblClickHandler);
   }
 
   /* ══════════════════════════════════════════════════════════════════════
@@ -216,6 +217,9 @@ export class Game {
         this.renderer.polyline(shape.points, color);
       } else if (shape.type === "arrow") {
         this.renderer.arrow(shape.points, color);
+      }
+      else if (shape.type === "text") {
+        this.renderer.text(shape.x, shape.y, shape.text, color, shape.fontSize, shape.fontFamily);
       }
     });
 
@@ -349,6 +353,10 @@ export class Game {
   private commitShape(shape: Shape) {
     this.existingShapes.push(shape);
     this.shapeIds.add(shape.id);
+    // paint it now rather than waiting for the server to echo it back: text
+    // would otherwise disappear with its editor and reappear a round trip
+    // later. Drag tools hide this because their preview already drew it.
+    this.clearCanvas();
     // id and type travel at the top level: they are identity, not geometry, so
     // they stay out of the JSON column that `data` becomes
     const { type, id, ...data } = shape;
@@ -393,6 +401,7 @@ export class Game {
     this.canvas.addEventListener("mousedown", this.mouseDownHandler);
     this.canvas.addEventListener("mouseup", this.mouseUpHandler);
     this.canvas.addEventListener("mousemove", this.mouseMoveHandler);
+    this.canvas.addEventListener("dblclick", this.dblClickHandler);
   }
 
   /** where the cursor is now */
@@ -415,12 +424,13 @@ export class Game {
     this.startX = e.clientX;
     this.startY = e.clientY;
 
-    // text is placed, not dragged: hand the point to React and let the editor
-    // overlay take over. clicked goes back to false so no preview is drawn
-    // while someone is typing.
+    // text is placed by a double click - see dblClickHandler. Opening the
+    // editor from mousedown as well would unmount the one already being typed
+    // in (the key changes), so the text would be discarded on the very click
+    // meant to commit it. clicked goes back to false so no preview is drawn
+    // while someone types.
     if (this.selectedTool === "text") {
       this.clicked = false;
-      this.onTextRequest?.(this.pointOf(e));
       return;
     }
 
@@ -434,6 +444,21 @@ export class Game {
         roomId: this.roomId,
       });
     }
+  };
+
+  /**
+   * A double click with the text tool opens the editor at that point.
+   *
+   * Double click rather than a single one so a stray click on the board does
+   * not leave an editor open, and so the gesture stays available to "edit the
+   * text under the cursor" later.
+   *
+   * Nothing happens here without a listener: React registers one through
+   * setOnTextRequest, and owns the editor itself.
+   */
+  dblClickHandler = (e: MouseEvent) => {
+    if (this.selectedTool !== "text") return;
+    this.onTextRequest?.(this.pointOf(e));
   };
 
   /**
