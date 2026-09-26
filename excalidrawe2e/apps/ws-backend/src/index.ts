@@ -27,6 +27,46 @@ function isConnectionError(err: unknown): boolean {
         name === "PrismaClientRustPanicError"
     );
 }
+function isPartOfRoom(socket : WebSocket, roomId: unknown) {
+    if(typeof roomId !="string" || roomId.length == 0) return false;
+    const user = users.find(x => x.socket === socket)
+            if(!user){
+                return false;
+            }
+            return user.rooms.includes(roomId);
+}
+function requireRoom(socket: WebSocket, roomId: unknown): boolean {
+    if (isPartOfRoom(socket, roomId)) return true;
+    socket.send(JSON.stringify({
+        type: "error",
+        message: "You have not joined that room",
+    }));
+    return false;
+}
+/**
+ * Is this user the room's admin?
+ *
+ * roomId arrives as the room's numeric id in string form - the same value the
+ * shape branch passes through Number() - so the lookup is by id, not slug.
+ *
+ * Fails closed. A database error is not caught here: withDb retries a cold
+ * connection, and anything that survives that reaches the handler's outer
+ * catch, which refuses the message. Returning something truthy on failure
+ * would let a hiccup grant permission to wipe a board.
+ */
+async function isAdmin(roomId: unknown, userId: string): Promise<boolean> {
+    if (typeof roomId !== "string" || roomId.length === 0) return false;
+    const id = Number(roomId);
+    if (!Number.isInteger(id)) return false;
+
+    const room = await withDb(() =>
+        prismaClient.room.findUnique({
+            where: { id },
+            select: { adminId: true },
+        })
+    );
+    return room?.adminId === userId;
+}
 
 /**
  * Run a database call, retrying while the connection is at fault.
@@ -157,6 +197,14 @@ wss.on("connection" , function(socket,request){
 
         if (parsedData.type === "clear_room") {
             const roomId = parsedData.roomId;
+            if(!requireRoom(socket, roomId)) return;
+            if (!(await isAdmin(roomId, userId, ))) {
+                socket.send(JSON.stringify({
+                    type: "error",
+                    message: "Only the room's owner can clear the board",
+                }));
+                return;
+            }
             await withDb(() => prismaClient.shape.deleteMany({
               where: { roomId: Number(roomId) },
             }));
@@ -170,6 +218,7 @@ wss.on("connection" , function(socket,request){
 
         if(parsedData.type === "shape"){
             const roomId = parsedData.roomId
+            if(!requireRoom(socket, roomId)) return;
             const shape = parsedData.shape;
             const id = parsedData.id ?? shape?.id;
 

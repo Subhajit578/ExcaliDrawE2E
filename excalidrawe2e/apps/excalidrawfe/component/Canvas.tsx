@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { IconButton } from "./IconButton";
 import {
   Circle,
@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { Game } from "@/draw/Game";
 import TextOverlay from "./TextOverlay";
+import { makeNotice, ToastStack, type Notice } from "./Toast";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE,
@@ -40,6 +42,20 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   const [selectedColor, setSelectedColor] = useState<ColorName>(DEFAULT_COLOR);
   // where the text editor is open, or null when there isn't one
   const [editing, setEditing] = useState<Point | null>(null);
+  // messages shown over the board: server refusals, load failures, confirmations
+  const [notices, setNotices] = useState<Notice[]>([]);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+
+  const showNotice = useCallback(
+    (message: string, tone: "error" | "info" | "success" = "error") => {
+      setNotices((current) => [...current, makeNotice(message, tone)]);
+    },
+    []
+  );
+
+  const dismissNotice = useCallback((id: string) => {
+    setNotices((current) => current.filter((n) => n.id !== id));
+  }, []);
   const { theme, choice, cycle } = useTheme();
   const palette = THEMES[theme];
 
@@ -58,6 +74,10 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   useEffect(() => {
     game?.setOnTextRequest((at) => setEditing(at));
   }, [game]);
+
+  useEffect(() => {
+    game?.setOnNotice(showNotice);
+  }, [game, showNotice]);
 
   useEffect(() => {
     const update = () => setSize({ w: window.innerWidth, h: window.innerHeight });
@@ -84,8 +104,7 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
 
   function handleClear() {
     if (!game) return;
-    if (!confirm("Clear all shapes? This cannot be undone.")) return;
-    game.clearRoom();
+    setConfirmingClear(true);
   }
 
   return (
@@ -116,6 +135,21 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
           onCancel={() => setEditing(null)}
         />
       )}
+
+      {confirmingClear && (
+        <ConfirmDialog
+          title="Clear this board?"
+          message="Every shape is removed for everyone in the room. This cannot be undone."
+          confirmLabel="Clear board"
+          onConfirm={() => {
+            setConfirmingClear(false);
+            game?.clearRoom();
+          }}
+          onCancel={() => setConfirmingClear(false)}
+        />
+      )}
+
+      <ToastStack notices={notices} onDismiss={dismissNotice} />
 
       <TopBar
         selectedTool={selectedTool}

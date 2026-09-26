@@ -2,6 +2,7 @@
 import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import axios from "axios";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
   Sparkles,
   Plus,
@@ -12,6 +13,7 @@ import {
   Share2,
   Check,
   MoreVertical,
+  Users,
 } from "lucide-react";
 
 type Room = {
@@ -20,11 +22,24 @@ type Room = {
   createdAt: string;
 };
 
+/** A room someone else owns, opened through a shared link. */
+type JoinedRoom = Room & {
+  owner?: string;
+  joinedAt?: string;
+};
+
 const API = "http://localhost:3001";
 
 export function Dashboard() {
   const router = useRouter();
   const [rooms, setRooms] = useState<Room[]>([]);
+  // rooms other people own, picked up by opening their link
+  const [joinedRooms, setJoinedRooms] = useState<JoinedRoom[]>([]);
+  // the canvas awaiting a delete confirmation, or null
+  const [deleteTarget, setDeleteTarget] = useState<Room | null>(null);
+  const [joinInput, setJoinInput] = useState("");
+  const [isJoining, setIsJoining] = useState(false);
+  const [joinError, setJoinError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -65,12 +80,45 @@ export function Dashboard() {
     return { Authorization: `Bearer ${localStorage.getItem("token")}` };
   }
 // 
+  /**
+   * Accepts either a full link or a bare name, so pasting what someone sent
+   * you works as well as typing the canvas name: everything up to the last
+   * "/" is dropped, along with any query string or fragment.
+   */
+  function slugFromInput(value: string) {
+    const trimmed = value.trim().split(/[?#]/)[0] ?? "";
+    const parts = trimmed.split("/").filter(Boolean);
+    return parts[parts.length - 1] ?? "";
+  }
+
+  async function handleJoin(e: React.FormEvent) {
+    e.preventDefault();
+    const slug = slugFromInput(joinInput);
+    if (!slug) return;
+
+    setIsJoining(true);
+    setJoinError(null);
+    try {
+      // join first, so a wrong link reports here rather than on a blank canvas
+      await axios.post(`${API}/room/${slug}/join`, {}, { headers: authHeaders() });
+      router.push(`/canvas/${slug}`);
+    } catch (err: any) {
+      setJoinError(
+        err?.response?.status === 404
+          ? "No canvas with that link"
+          : err?.response?.data?.message ?? "Could not open that canvas"
+      );
+      setIsJoining(false);
+    }
+  }
+
   async function fetchRooms() {
     setIsLoading(true);
     setErrorMsg(null);
     try {
       const res = await axios.get(`${API}/rooms`, { headers: authHeaders() });
       setRooms(res.data.rooms);
+      setJoinedRooms(res.data.joined ?? []);
     } catch (err: any) {
       setErrorMsg(err?.response?.data?.message ?? "Failed to load canvases");
     } finally {
@@ -98,12 +146,19 @@ export function Dashboard() {
   }
 
   async function handleDelete(id: number) {
-    if (!confirm(" Delete ? ")) return;
+    const room = rooms.find((r) => r.id === id) ?? null;
+    setDeleteTarget(room);
+  }
+
+  async function confirmDelete() {
+    const room = deleteTarget;
+    if (!room) return;
+    setDeleteTarget(null);
     try {
-      await axios.delete(`${API}/room/${id}`, { headers: authHeaders() });
-      setRooms((r) => r.filter((room) => room.id !== id));
-    } catch {
-      alert("Failed to delete");
+      await axios.delete(`${API}/room/${room.id}`, { headers: authHeaders() });
+      setRooms((r) => r.filter((existing) => existing.id !== room.id));
+    } catch (err: any) {
+      setErrorMsg(err?.response?.data?.message ?? "Failed to delete that canvas");
     }
   }
 
@@ -180,13 +235,44 @@ export function Dashboard() {
               {rooms.length} {rooms.length === 1 ? "canvas" : "canvases"}
             </p>
           </div>
-          <button
-            onClick={() => setIsCreateOpen(true)}
-            className="flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-5 py-2.5 rounded-xl font-medium hover:from-indigo-700 hover:to-purple-700 shadow-lg hover:shadow-xl transition-all"
-          >
-            <Plus className="w-5 h-5" />
-            New canvas
-          </button>
+          <div className="flex items-center gap-3">
+            {/* Paste a link someone shared, or type the canvas name */}
+            <form onSubmit={handleJoin} className="flex items-center gap-2">
+              <div className="relative">
+                <input
+                  value={joinInput}
+                  onChange={(e) => {
+                    setJoinInput(e.target.value);
+                    setJoinError(null);
+                  }}
+                  placeholder="Paste a canvas link"
+                  aria-label="Canvas link or name"
+                  className="w-56 text-gray-900 placeholder:text-gray-500 bg-white/80 border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-colors"
+                />
+                {joinError && (
+                  <p className="absolute left-0 top-full mt-1 text-xs text-red-600">
+                    {joinError}
+                  </p>
+                )}
+              </div>
+              <button
+                type="submit"
+                disabled={isJoining || joinInput.trim() === ""}
+                className="flex items-center gap-2 bg-white text-gray-900 border border-gray-200 px-4 py-2.5 rounded-xl font-medium hover:bg-gray-50 shadow-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Users className="w-4 h-4" />
+                {isJoining ? "Joining…" : "Join"}
+              </button>
+            </form>
+
+            <button
+              onClick={() => setIsCreateOpen(true)}
+              className="flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-5 py-2.5 rounded-xl font-medium hover:from-indigo-700 hover:to-purple-700 shadow-lg hover:shadow-xl transition-all"
+            >
+              <Plus className="w-5 h-5" />
+              New canvas
+            </button>
+          </div>
         </div>
 
         {isLoading ? (
@@ -328,7 +414,60 @@ export function Dashboard() {
             ))}
           </div>
         )}
+
+        {/* Rooms belonging to other people, collected by opening their links.
+            No rename or delete here - they are not yours to change. */}
+        {joinedRooms.length > 0 && (
+          <section className="mt-12">
+            <h2 className="text-lg font-semibold text-gray-900 mb-1">Shared with you</h2>
+            <p className="text-sm text-gray-600 mb-5">
+              Canvases you opened from someone else&apos;s link.
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+              {joinedRooms.map((room) => (
+                <div
+                  key={room.id}
+                  className="group bg-white/80 backdrop-blur-sm rounded-2xl border border-gray-100 shadow hover:shadow-xl transition-all overflow-hidden"
+                >
+                  <div
+                    onClick={() => router.push(`/canvas/${room.slug}`)}
+                    className="h-32 bg-gradient-to-br from-emerald-100 via-cyan-100 to-indigo-100 cursor-pointer relative overflow-hidden"
+                  >
+                    <div className="absolute inset-0 flex items-center justify-center opacity-30 group-hover:opacity-50 transition-opacity">
+                      <Users className="w-12 h-12 text-emerald-600" />
+                    </div>
+                  </div>
+
+                  <div className="p-4">
+                    <h3 className="font-semibold text-gray-900 truncate">{room.slug}</h3>
+                    <p className="text-sm text-gray-600 mt-0.5">
+                      {room.owner ? `Owned by ${room.owner}` : "Shared canvas"}
+                    </p>
+
+                    <button
+                      onClick={() => router.push(`/canvas/${room.slug}`)}
+                      className="mt-4 w-full flex items-center justify-center gap-1.5 bg-gray-900 text-white text-sm py-2 rounded-lg hover:bg-gray-800 transition-colors"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      Open
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
       </main>
+
+      {deleteTarget && (
+        <ConfirmDialog
+          title={`Delete "${deleteTarget.slug}"?`}
+          message="The canvas and everything drawn on it are removed for everyone. This cannot be undone."
+          confirmLabel="Delete canvas"
+          onConfirm={confirmDelete}
+          onCancel={() => setDeleteTarget(null)}
+        />
+      )}
 
       {/* Create modal */}
       {isCreateOpen && (

@@ -8,13 +8,14 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 model User {
-  id      String   @id    @default(uuid()) 
+  id      String   @id    @default(uuid())
   email       String     @unique
   username    String      @unique
   password    String
-  photo       String   
+  photo       String
   rooms       Room[]
   shapes       Shape[]
+  memberships RoomMember[]
 }
 model Room {
   id       Int @id@default(autoincrement())
@@ -23,6 +24,21 @@ model Room {
   admin    User      @relation(fields: [adminId], references: [id])
   createdAt    DateTime @default(now())
   shapes    Shape[]
+  members   RoomMember[]
+}
+
+/// Someone who opened a room they do not own, so it can be listed on their
+/// dashboard. The admin is never a member - ownership is the Room.adminId
+/// relation, and mixing the two would show owned rooms twice.
+model RoomMember {
+  id       Int      @id @default(autoincrement())
+  roomId   Int
+  userId   String
+  joinedAt DateTime @default(now())
+  room     Room     @relation(fields: [roomId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+
+  @@unique([roomId, userId])
 }
 
 

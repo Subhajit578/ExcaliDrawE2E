@@ -112,6 +112,9 @@ export class Game {
   /** set by React; asks it to open a text editor at a point. See setOnTextRequest. */
   private onTextRequest: ((at: Point) => void) | null = null;
 
+  /** set by React; shows a message to the person. See setOnNotice. */
+  private onNotice: ((message: string, tone: "error" | "info" | "success") => void) | null = null;
+
   /* ══════════════════════════════════════════════════════════════════════
    * Lifecycle
    * ══════════════════════════════════════════════════════════════════════ */
@@ -165,6 +168,23 @@ export class Game {
    */
   setOnTextRequest(cb: (at: Point) => void) {
     this.onTextRequest = cb;
+  }
+
+  /**
+   * Register how to show a message. Anything the person should know about but
+   * cannot see on the canvas goes through here: a refusal from the server, a
+   * board that would not load, a shape that failed to save.
+   *
+   * Without it these only reach the console, where nobody is looking.
+   */
+  setOnNotice(cb: (message: string, tone: "error" | "info" | "success") => void) {
+    this.onNotice = cb;
+  }
+
+  /** report something to the person, and keep it in the console for debugging */
+  private notify(message: string, tone: "error" | "info" | "success" = "error") {
+    if (tone === "error") console.error("[canvas]", message);
+    this.onNotice?.(message, tone);
   }
 
   /** Takes a palette name ("ink", "red"), never a hex value. */
@@ -256,6 +276,7 @@ export class Game {
       this.clearCanvas();
     } catch (err) {
       console.error("[canvas] could not load existing shapes:", err);
+      this.notify("Could not load this board. Reload to try again.");
     }
   }
 
@@ -314,7 +335,9 @@ export class Game {
           this.remoteStrokes.clear();
           this.clearCanvas();
         } else if (message.type === "error") {
-          console.error("[canvas] server rejected a message:", message.message);
+          // the server refused something - a board you do not own, a shape it
+          // could not save. The person needs to see this, not the console.
+          this.notify(message.message ?? "The server refused that action");
         }
       } catch (err) {
         console.error("[canvas] bad message from server:", err);

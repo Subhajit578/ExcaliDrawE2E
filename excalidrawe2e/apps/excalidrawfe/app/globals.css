@@ -18,3 +18,17 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/*
+ * Next.js renders its whole development overlay into <nextjs-portal>: the
+ * floating badge, and the error card that brings the badge back even with
+ * devIndicators: false. Hiding the element removes both.
+ *
+ * The trade-off: the red error overlay is hidden too. Compile and runtime
+ * errors still appear in the terminal running `pnpm dev` and in the browser
+ * console - comment this rule out when you want the overlay back while
+ * debugging. Development only; it does not exist in a production build.
+ */
+nextjs-portal {
+  display: none;
+}

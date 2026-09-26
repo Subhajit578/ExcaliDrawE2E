@@ -19,7 +19,20 @@ export function RoomCanvas({ slug }: { slug: string }) {
       .get(`http://localhost:3001/room/${slug}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
-      .then((res) => setRoomId(res.data.room.id))
+      .then((res) => {
+        setRoomId(res.data.room.id);
+        // Opening a shared link is what joining means: the room is recorded on
+        // this person's dashboard so they can get back to it. Idempotent, and
+        // a no-op for the owner, so it is fire-and-forget - a failure here
+        // must not stop the canvas loading.
+        axios
+          .post(
+            `http://localhost:3001/room/${slug}/join`,
+            {},
+            { headers: { Authorization: `Bearer ${token}` } }
+          )
+          .catch(() => {});
+      })
       .catch(() => setError("Room not found"));
   }, [slug]);
 

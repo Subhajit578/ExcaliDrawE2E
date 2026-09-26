@@ -116,17 +116,70 @@ app.get("/shapes/:roomId" , isLoggedIn, async (req, res) => {
         }
     }
 })
+/**
+ * Join a room by its slug - what happens when someone opens a shared link.
+ *
+ * Idempotent: joining twice is the same as joining once, and the admin is
+ * never recorded as a member, since ownership already lists the room for them.
+ */
+app.post("/room/:slug/join", isLoggedIn, async (req, res) => {
+    //@ts-ignore
+    const userId = req.userId;
+    try {
+        const room = await prismaClient.room.findUnique({
+            where: { slug: req.params.slug },
+            select: { id: true, slug: true, adminId: true },
+        });
+        if (!room) {
+            return res.status(404).send({ message: "Room not found" });
+        }
+        if (room.adminId === userId) {
+            return res.send({ room, joined: false, reason: "you own this room" });
+        }
+        await prismaClient.roomMember.upsert({
+            where: { roomId_userId: { roomId: room.id, userId } },
+            create: { roomId: room.id, userId },
+            update: {},
+        });
+        return res.send({ room, joined: true });
+    } catch (err) {
+        console.error("[http] join failed:", err);
+        return res.status(500).send({ message: "Could not join that room" });
+    }
+});
+
+/**
+ * Every room this person can get back to: the ones they created, plus the ones
+ * they have opened through a shared link. `owned` tells the two apart so the
+ * dashboard can group them and only offer rename or delete on its own.
+ */
 app.get("/rooms", isLoggedIn, async(req, res) => {
     //@ts-ignore
 const userId = req.userId
 try {
-const rooms = await prismaClient.room.findMany({
+const owned = await prismaClient.room.findMany({
     where : {adminId : userId},
-    orderBy: {createdAt: "desc"}, 
+    orderBy: {createdAt: "desc"},
     select : {id:true, slug: true, createdAt:true}
 })
-res.send({rooms})
-} 
+const memberships = await prismaClient.roomMember.findMany({
+    where: { userId },
+    orderBy: { joinedAt: "desc" },
+    select: {
+        joinedAt: true,
+        room: { select: { id: true, slug: true, createdAt: true, admin: { select: { username: true } } } },
+    },
+})
+const joined = memberships.map((m) => ({
+    ...m.room,
+    joinedAt: m.joinedAt,
+    owner: m.room.admin.username,
+}))
+res.send({
+    rooms: owned.map((r) => ({ ...r, owned: true })),
+    joined: joined.map(({ admin, ...r }: any) => ({ ...r, owned: false })),
+})
+}
 catch(err) {
     res.status(404).send({err : "Error finding user docs"})
 }
