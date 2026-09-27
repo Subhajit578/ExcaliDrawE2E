@@ -215,7 +215,59 @@ wss.on("connection" , function(socket,request){
             });
             return;
         }
-
+        if(parsedData.type ==="update_shape") {
+            const roomId = parsedData.roomId;
+            if(!requireRoom(socket, roomId)) return;
+            const data = parsedData.data;
+            const id = parsedData.id;
+            if (typeof id !== "string" || id.length === 0 || id.length > 100) {
+                socket.send(JSON.stringify({ type: "error", message: "Shape is missing a valid id" }));
+                return;
+            }
+            if (typeof data !== "object" || data === null || Array.isArray(data)) {
+                socket.send(JSON.stringify({ type: "error", message: "Shape update is missing its data" }));
+                return;
+            }
+            const updated = await withDb(() =>  prismaClient.shape.updateMany({
+                where: {id}, 
+                data : { data}
+            }))
+            if (updated.count === 0) {
+                socket.send(JSON.stringify({ type: "error", message: "That shape no longer exists" }));
+                return;
+            }
+        
+            users.forEach(user => {
+                if(user.rooms.includes(roomId)){
+                    user.socket.send(JSON.stringify({
+                        type:"update_shape",
+                        id, data, roomId
+                    }))
+                }
+            })
+            return;
+        }
+        if(parsedData.type ==="delete_shape") {
+            const roomId = parsedData.roomId;
+            if(!requireRoom(socket, roomId)) return;
+            const id = parsedData.id;
+            if (typeof id !== "string" || id.length === 0 || id.length > 100) {
+                socket.send(JSON.stringify({ type: "error", message: "Shape is missing a valid id" }));
+                return;
+            }
+            const deleted = await withDb(() =>  prismaClient.shape.deleteMany({
+                where: {id}, 
+            }))
+            users.forEach(user => {
+                if(user.rooms.includes(roomId)){
+                    user.socket.send(JSON.stringify({
+                        type:"delete_shape",
+                        id, roomId
+                    }))
+                }
+            })
+            return;
+        }
         if(parsedData.type === "shape"){
             const roomId = parsedData.roomId
             if(!requireRoom(socket, roomId)) return;

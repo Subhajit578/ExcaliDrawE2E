@@ -1,8 +1,13 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
-import { ShapeRenderer, type Point } from "./renderer";
+import { ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
+import { boundsOf } from "./hitTest";
+
+/** how long a newly drawn shape keeps its fading pad, in ms */
+const APPEAR_MS = 450;
 import { circleFromDrag, elbowPoints } from "./routing";
+import { hitTest } from "./hitTest";
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Types
@@ -19,37 +24,17 @@ import { circleFromDrag, elbowPoints } from "./routing";
  * pencil, line and arrow share one structure on purpose: three types, one list
  * of points, so hit-testing and transforms can be written once for all three.
  */
-type Shape =
+export type Shape =
   | { type: "rect"; x: number; y: number; width: number; height: number; color: string; id: string }
   | { type: "circle"; centerX: number; centerY: number; radius: number; color: string; id: string  }
   | { type: "pencil"; points: Point[]; color: string; id: string  }
-  // line and arrow are polylines: two points for a straight run, three for an
-  // elbow. Identical shapes, so one is convertible to the other later.
   | { type: "line"; points: Point[]; color: string; id: string }
   | { type: "arrow"; points: Point[]; color: string; id: string }
-  // x,y is the top-left of the first line, matching the editor overlay's box.
-  // Size and family are stored per shape: they cannot be recovered from the
-  // string later, and export and hit-testing will both need them.
   | { type: "text"; x: number; y: number; text: string; fontSize: number; fontFamily: string; color: string; id: string };
 
-/**
- * A stroke someone else is drawing right now. Held only until their finished
- * shape arrives, then dropped in favour of the saved version. Never persisted.
- */
+
 type RemoteStroke = { color: string; points: Point[] };
 
-/* ────────────────────────────────────────────────────────────────────────────
- * Helpers
- * ──────────────────────────────────────────────────────────────────────────── */
-
-/**
- * A v4 UUID for a new shape.
- *
- * crypto.randomUUID() only exists in a secure context, so it is undefined when
- * the app is opened over plain http on a LAN address - a phone on the same
- * wifi, say. getRandomValues works everywhere, so the fallback builds the same
- * thing by hand rather than letting ids come out undefined.
- */
 function newId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -62,22 +47,6 @@ function newId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/* ────────────────────────────────────────────────────────────────────────────
- * Game
- * ──────────────────────────────────────────────────────────────────────────── */
-
-/**
- * One board: the shapes on it, the socket that syncs them, and the mouse.
- *
- * Deliberately framework-free - React owns *what* the settings are (tool,
- * colour, theme) and pushes them in through setters; this class owns the
- * drawing. It never reads React state and never calls back into it, with one
- * exception: text needs a real DOM editor, so React registers a callback.
- *
- * Rendering is immediate-mode: there are no retained objects, only a list of
- * shapes and a full repaint. So anything that changes what should be on screen
- * has to call repaint() - the browser will not do it for you.
- */
 export class Game {
   /* ── canvas ─────────────────────────────────────────────────────────── */
   private canvas: HTMLCanvasElement;
@@ -105,6 +74,15 @@ export class Game {
   private currentStroke: Point[] = [];
   /** names the stroke being drawn, so receivers can drop their live copy */
   private currentStrokeId: string | null = null;
+  /** where the eraser was on the previous move, so its path can be sampled */
+  private lastErasePoint: Point | null = null;
+  /** the cursor, tracked while the eraser is active so its reach can be drawn */
+  private cursor: Point | null = null;
+
+  /* ── the appear animation ───────────────────────────────────────────── */
+  /** shape id -> when it appeared, so a fading pad can be drawn behind it */
+  private appearing: Map<string, number> = new Map();
+  private animationFrame: number | null = null;
 
   /* ── networking ─────────────────────────────────────────────────────── */
   socket: WebSocket;
@@ -148,6 +126,7 @@ export class Game {
     this.canvas.removeEventListener("mouseup", this.mouseUpHandler);
     this.canvas.removeEventListener("mousemove", this.mouseMoveHandler);
     this.canvas.removeEventListener("dblclick", this.dblClickHandler);
+    if (this.animationFrame !== null) cancelAnimationFrame(this.animationFrame);
   }
 
   /* ══════════════════════════════════════════════════════════════════════
@@ -155,7 +134,16 @@ export class Game {
    * ══════════════════════════════════════════════════════════════════════ */
 
   setTool(tool: Tool) {
+    const wasEraser = this.selectedTool === "eraser";
     this.selectedTool = tool;
+
+    // hide the system pointer behind the eraser's own ring, and clear the ring
+    // when switching away so it does not linger over the board
+    this.canvas.style.cursor = tool === "eraser" ? "none" : "default";
+    if (wasEraser && tool !== "eraser") {
+      this.cursor = null;
+      this.clearCanvas();
+    }
   }
 
   /**
@@ -223,9 +211,25 @@ export class Game {
   clearCanvas() {
     this.renderer.clear(THEMES[this.theme].canvas);
 
+    const now = performance.now();
+
     this.existingShapes.forEach((shape) => {
       // stored colours are palette names now, but old rows hold raw hex
       const color = this.paintColor(shape.color);
+
+      // a pad behind anything that just appeared, fading over APPEAR_MS
+      const appearedAt = this.appearing.get(shape.id);
+      if (appearedAt !== undefined) {
+        const progress = (now - appearedAt) / APPEAR_MS;
+        if (progress >= 1) {
+          this.appearing.delete(shape.id);
+        } else {
+          const b = boundsOf(shape);
+          // ease out: bright immediately, then away quickly
+          const alpha = 0.28 * (1 - progress) * (1 - progress);
+          this.renderer.highlight(b.left, b.top, b.right - b.left, b.bottom - b.top, color, alpha);
+        }
+      }
 
       if (shape.type === "rect") {
         this.renderer.rect(shape.x, shape.y, shape.width, shape.height, color);
@@ -248,6 +252,18 @@ export class Game {
     this.remoteStrokes.forEach((stroke) => {
       this.renderer.stroke(stroke.points, this.paintColor(stroke.color));
     });
+
+    // the eraser's reach, on top of everything so it is never hidden
+    if (this.selectedTool === "eraser" && this.cursor) {
+      this.renderer.eraserCursor(this.cursor, ERASER_RADIUS, THEMES[this.theme].panelMuted);
+    }
+
+    // ids that no longer match a shape would keep the animation loop alive
+    if (this.appearing.size > 0) {
+      for (const id of this.appearing.keys()) {
+        if (!this.shapeIds.has(id)) this.appearing.delete(id);
+      }
+    }
   }
 
   /**
@@ -303,7 +319,10 @@ export class Game {
           // our own shape coming back (or a resend): we already have it, so
           // adding it again would leave two copies of one shape in the array
           if (!id || !this.shapeIds.has(id)) {
-            if (id) this.shapeIds.add(id);
+            if (id) {
+              this.shapeIds.add(id);
+              this.markAppearing(id);
+            }
             this.existingShapes.push({
               id,
               type: incomingShape.type,
@@ -329,14 +348,19 @@ export class Game {
             stroke.points.push(message.point);
             this.clearCanvas();
           }
-        } else if (message.type === "clear_room") {
+        } 
+        else if(message.type === "update_shape") {
+
+        } 
+        else if(message.type === "delete_shape") {
+
+        }
+        else if (message.type === "clear_room") {
           this.existingShapes = [];
           this.shapeIds.clear();
           this.remoteStrokes.clear();
           this.clearCanvas();
         } else if (message.type === "error") {
-          // the server refused something - a board you do not own, a shape it
-          // could not save. The person needs to see this, not the console.
           this.notify(message.message ?? "The server refused that action");
         }
       } catch (err) {
@@ -376,6 +400,7 @@ export class Game {
   private commitShape(shape: Shape) {
     this.existingShapes.push(shape);
     this.shapeIds.add(shape.id);
+    this.markAppearing(shape.id);
     // paint it now rather than waiting for the server to echo it back: text
     // would otherwise disappear with its editor and reappear a round trip
     // later. Drag tools hide this because their preview already drew it.
@@ -395,7 +420,35 @@ export class Game {
       roomId: this.roomId,
     });
   }
-
+   updateShape(shape: Shape) {
+    const index = this.existingShapes.findIndex((s) => s.id === shape.id)
+    if(index ==-1) {
+      return;
+    }
+    this.existingShapes[index] = shape;
+    this.clearCanvas();
+    const { type, id, ...data } = shape;
+    this.send({
+      type:"update_shape", 
+      id, 
+      data,
+      roomId: this.roomId,
+    }) 
+  }
+   deleteShape(id: string) {
+    const index = this.existingShapes.findIndex((s) => s.id === id)
+    if(index ===-1) {
+      return;
+    }
+    this.existingShapes.splice(index, 1);
+    this.shapeIds.delete(id)
+    this.clearCanvas();
+    this.send({
+      type:"delete_shape", 
+      id,
+      roomId: this.roomId,
+    }) 
+  }
   /**
    * Create a text shape. Called by the editor overlay once someone finishes
    * typing - the position came from the click that opened it.
@@ -438,6 +491,43 @@ export class Game {
   }
 
   /**
+   * Mark a shape as newly arrived, so the repaint draws a pad behind it that
+   * fades away. Runs for shapes you drew and shapes other people drew - which
+   * is the point: it is how you notice something appearing across the room.
+   */
+  private markAppearing(id: string) {
+    this.appearing.set(id, performance.now());
+    this.runAppearAnimation();
+  }
+
+  /**
+   * Repaint on every frame while any shape is still fading in, then stop.
+   *
+   * Immediate-mode rendering means nothing animates on its own: each frame has
+   * to be drawn. The loop ends as soon as the last animation expires, so an
+   * idle board costs nothing.
+   */
+  private runAppearAnimation() {
+    if (this.animationFrame !== null) return;
+    this.animationFrame = requestAnimationFrame(() => {
+      this.animationFrame = null;
+      this.clearCanvas();
+      if (this.appearing.size > 0) this.runAppearAnimation();
+    });
+  }
+
+  /**
+   * Erase the topmost shape under a point, if there is one.
+   *
+   * No record of what has already been erased is needed: deleteShape removes
+   * the shape from existingShapes, so the next hit test cannot find it again.
+   */
+  private eraseAt(at: Point) {
+    const hit = hitTest(this.existingShapes, at, ERASER_RADIUS);
+    if (hit) this.deleteShape(hit.id);
+  }
+
+  /**
    * Record where the drag began. Only the pencil does more than that: it is
    * the one tool that streams to other people while it is being drawn, so it
    * announces itself here.
@@ -446,7 +536,6 @@ export class Game {
     this.clicked = true;
     this.startX = e.clientX;
     this.startY = e.clientY;
-
     // text is placed by a double click - see dblClickHandler. Opening the
     // editor from mousedown as well would unmount the one already being typed
     // in (the key changes), so the text would be discarded on the very click
@@ -456,8 +545,13 @@ export class Game {
       this.clicked = false;
       return;
     }
-
-    if (this.selectedTool === "pencil") {
+    else if(this.selectedTool === "eraser") {
+      // start the path here, or the first move would sweep all the way from
+      // wherever the previous erase drag happened to end
+      this.lastErasePoint = this.pointOf(e);
+      this.eraseAt(this.pointOf(e));
+    }
+    else if (this.selectedTool === "pencil") {
       this.currentStrokeId = newId();
       this.currentStroke = [this.pointOf(e)];
       this.send({
@@ -491,6 +585,7 @@ export class Game {
    */
   mouseUpHandler = (e: MouseEvent) => {
     this.clicked = false;
+    this.lastErasePoint = null;
 
     // text commits from the editor's blur, never from a mouseup
     if (this.selectedTool === "text") return;
@@ -582,6 +677,13 @@ export class Game {
    * mouseup, so other people see them appear on release.
    */
   mouseMoveHandler = (e: MouseEvent) => {
+    // the eraser draws its reach under the cursor, so it needs the position on
+    // every move - not only while the button is held
+    if (this.selectedTool === "eraser") {
+      this.cursor = this.pointOf(e);
+      if (!this.clicked) this.clearCanvas();
+    }
+
     if (this.clicked) {
       const width = e.clientX - this.startX;
       const height = e.clientY - this.startY;
@@ -597,6 +699,22 @@ export class Game {
           this.pointOf(e)
         );
         this.renderer.circle(centerX, centerY, radius, color);
+      }
+      else if(selectedTool === "eraser") {
+        // Sample along the path the cursor took since the last event, not just
+        // where it is now: mouse events arrive every 8-16ms, so a fast swipe
+        // jumps 40px or more and thin shapes would slip through the gaps.
+        const from = this.lastErasePoint ?? this.dragStart();
+        const to = this.pointOf(e);
+        const steps = Math.max(1, Math.ceil(Math.hypot(to.x - from.x, to.y - from.y) / 4));
+        for (let s = 1; s <= steps; s++) {
+          const t = s / steps;
+          this.eraseAt({
+            x: from.x + (to.x - from.x) * t,
+            y: from.y + (to.y - from.y) * t,
+          });
+        }
+        this.lastErasePoint = to;
       } else if (selectedTool === "pencil" && this.currentStrokeId) {
         const point = this.pointOf(e);
         this.currentStroke.push(point);

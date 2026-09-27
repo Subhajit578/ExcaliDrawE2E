@@ -11,7 +11,8 @@ import {
   Trash2,
   Minus,
   MoveUpRight,
-  Type
+  Type,
+  Eraser
 } from "lucide-react";
 import { Game } from "@/draw/Game";
 import TextOverlay from "./TextOverlay";
@@ -31,7 +32,7 @@ import {
   type ThemeChoice,
 } from "@/draw/theme";
 
-export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text";
+export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text" | "eraser";
 
 export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }) {
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -254,6 +255,13 @@ function TopBar({
           activated={selectedTool === "text"}
           icon={<Type size={20} />}
           title="Text"
+          {...iconProps}
+        />
+        <IconButton
+          onClick={() => setSelectedTool("eraser")}
+          activated={selectedTool === "eraser"}
+          icon={<Eraser size={20} />}
+          title="Eraser"
           {...iconProps}
         />
       </div>

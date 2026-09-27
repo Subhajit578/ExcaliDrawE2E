@@ -20,6 +20,15 @@ export const LINE_HEIGHT = 1.25;
 export const DEFAULT_FONT_SIZE = 20;
 
 /**
+ * Reach of the eraser, in pixels.
+ *
+ * Two readers: the hit test that decides what is erased, and the circle drawn
+ * under the cursor. If those drift apart the eraser starts removing things it
+ * visibly never touched.
+ */
+export const ERASER_RADIUS = 12;
+
+/**
  * Family new text is created with.
  *
  * A system stack rather than the app's Geist: ctx.font cannot read a CSS
@@ -50,6 +59,45 @@ export class ShapeRenderer {
 
   constructor(ctx: CanvasRenderingContext2D) {
     this.ctx = ctx;
+  }
+
+  /**
+   * A soft pad behind a shape that has just appeared, fading out.
+   *
+   * save/restore rather than setting every property: globalAlpha and the dash
+   * pattern would otherwise leak into whatever is drawn next, and unlike
+   * strokeStyle nobody else sets them back.
+   */
+  highlight(left: number, top: number, width: number, height: number, color: string, alpha: number) {
+    const pad = 6;
+    this.ctx.save();
+    this.ctx.globalAlpha = alpha;
+    this.ctx.fillStyle = color;
+    this.ctx.beginPath();
+    this.ctx.roundRect(left - pad, top - pad, width + pad * 2, height + pad * 2, 10);
+    this.ctx.fill();
+    this.ctx.restore();
+  }
+
+  /** the eraser's reach, drawn under the cursor so its size is visible */
+  eraserCursor(at: Point, radius: number, color: string) {
+    this.ctx.save();
+    this.ctx.strokeStyle = color;
+    this.ctx.fillStyle = color;
+    this.ctx.lineWidth = 1;
+    this.ctx.setLineDash([3, 3]);
+
+    this.ctx.beginPath();
+    this.ctx.arc(at.x, at.y, radius, 0, Math.PI * 2);
+    this.ctx.stroke();
+
+    // a dot at the centre: the ring alone is hard to aim with
+    this.ctx.setLineDash([]);
+    this.ctx.globalAlpha = 0.9;
+    this.ctx.beginPath();
+    this.ctx.arc(at.x, at.y, 1.5, 0, Math.PI * 2);
+    this.ctx.fill();
+    this.ctx.restore();
   }
 
   /** wipe the canvas and lay down the board colour */
