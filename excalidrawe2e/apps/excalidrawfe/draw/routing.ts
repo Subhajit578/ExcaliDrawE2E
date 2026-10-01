@@ -7,37 +7,6 @@ import type { Point } from "./renderer";
  */
 const STRAIGHT_THRESHOLD = 8;
 
-/**
- * Turn a drag into an elbow route - a path made only of horizontal and
- * vertical segments.
- *
- * A drag gives two points, and an elbow needs a corner between them that
- * nobody supplied. Both corners are legal, so this picks one: travel along the
- * longer axis first, which leaves the shorter leg as the final approach.
- *
- *   from ●────────────┐          |dx| > |dy|: across, then down
- *                     │
- *                     ● to
- *
- * Pure on purpose - the live preview and the shape that gets saved both call
- * it, so they cannot disagree, and the rule can be replaced here (Z-routing,
- * obstacle avoidance) without touching the renderer, the shape type or the
- * database.
- *
- * The returned points are fresh objects, so callers can move them later
- * without reaching back into whatever was passed in.
- */
-/**
- * Turn a drag into a circle: centred on the middle of the dragged box, sized to
- * the largest circle that fits inside it.
- *
- * Both values come from the box rather than from a single axis. That is what
- * makes dragging up or left work - the deltas are negative then, and taking the
- * midpoint handles the sign without any special cases. Math.min keeps the
- * circle inside the box you dragged; Math.max would spill outside it.
- *
- * Shared by the live preview and the committed shape so the two cannot differ.
- */
 export function circleFromDrag(
   from: Point,
   to: Point

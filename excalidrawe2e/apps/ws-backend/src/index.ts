@@ -229,7 +229,9 @@ wss.on("connection" , function(socket,request){
                 return;
             }
             const updated = await withDb(() =>  prismaClient.shape.updateMany({
-                where: {id}, 
+                // scoped to the room: membership of roomId alone must not let
+                // someone edit a shape that lives on another board
+                where: { id, roomId: Number(roomId) },
                 data : { data}
             }))
             if (updated.count === 0) {
@@ -256,8 +258,11 @@ wss.on("connection" , function(socket,request){
                 return;
             }
             const deleted = await withDb(() =>  prismaClient.shape.deleteMany({
-                where: {id}, 
+                where: { id, roomId: Number(roomId) },
             }))
+            // nothing matched - already erased, or not a shape in this room -
+            // so there is nothing for anyone to remove
+            if (deleted.count === 0) return;
             users.forEach(user => {
                 if(user.rooms.includes(roomId)){
                     user.socket.send(JSON.stringify({

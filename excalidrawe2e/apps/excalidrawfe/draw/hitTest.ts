@@ -74,7 +74,9 @@ export function hitTest(shapes: Shape[], point: Point, tolerance: number) : Shap
         }
     }
     else if (shape.type === "rect") {
-        hit = rectangleCollision(point, shape.x, shape.y, shape.width, shape.height, tolerance)
+        // outline only, like the circle: rects are unfilled, so a point in
+        // the empty middle is not touching anything
+        hit = rectangleOutlineCollision(point, shape.x, shape.y, shape.width, shape.height, tolerance)
         if(hit ===true) {
             return shape
         } 
@@ -127,6 +129,16 @@ function rectangleCollision(p:Point, x:number, y:number, width:number, height:nu
     const top    = Math.min(y, y + height);
     const bottom = Math.max(y, y + height);
     return p.x >= left - t && p.x <= right + t && p.y >= top - t  && p.y <= bottom + t;
+}
+/** within t of any edge: inside the box grown by t, but not inside it shrunk by t */
+function rectangleOutlineCollision(p:Point, x:number, y:number, width:number, height:number, t:number) {
+    if (!rectangleCollision(p, x, y, width, height, t)) return false;
+    const left   = Math.min(x, x + width);
+    const right  = Math.max(x, x + width);
+    const top    = Math.min(y, y + height);
+    const bottom = Math.max(y, y + height);
+    const insideInner = p.x > left + t && p.x < right - t && p.y > top + t && p.y < bottom - t;
+    return !insideInner;
 }
 function segmentCollision(a:Point,b:Point ,p:Point, t:number) {
     const dx = b.x - a.x;

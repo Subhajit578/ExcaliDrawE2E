@@ -8,9 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import type { ThemeChoice, ThemeName } from "@/draw/theme";
-
 const STORAGE_KEY = "excalidraw-theme";
-
 type ThemeContextValue = {
   /** what the user picked: "system" until they choose otherwise */
   choice: ThemeChoice;

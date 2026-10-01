@@ -2,12 +2,11 @@ import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 import { ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
-import { boundsOf } from "./hitTest";
+import { circleFromDrag, elbowPoints } from "./routing";
+import { boundsOf, hitTest } from "./hitTest";
 
 /** how long a newly drawn shape keeps its fading pad, in ms */
 const APPEAR_MS = 450;
-import { circleFromDrag, elbowPoints } from "./routing";
-import { hitTest } from "./hitTest";
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Types
@@ -28,13 +27,33 @@ export type Shape =
   | { type: "rect"; x: number; y: number; width: number; height: number; color: string; id: string }
   | { type: "circle"; centerX: number; centerY: number; radius: number; color: string; id: string  }
   | { type: "pencil"; points: Point[]; color: string; id: string  }
+  // line and arrow are polylines: two points for a straight run, three for an
+  // elbow. Identical shapes, so one is convertible to the other later.
   | { type: "line"; points: Point[]; color: string; id: string }
   | { type: "arrow"; points: Point[]; color: string; id: string }
+  // x,y is the top-left of the first line, matching the editor overlay's box.
+  // Size and family are stored per shape: they cannot be recovered from the
+  // string later, and export and hit-testing will both need them.
   | { type: "text"; x: number; y: number; text: string; fontSize: number; fontFamily: string; color: string; id: string };
 
-
+/**
+ * A stroke someone else is drawing right now. Held only until their finished
+ * shape arrives, then dropped in favour of the saved version. Never persisted.
+ */
 type RemoteStroke = { color: string; points: Point[] };
+export type TextRequest = { at: Point; shape?: Extract<Shape, { type: "text" }> };
+/* ────────────────────────────────────────────────────────────────────────────
+ * Helpers
+ * ──────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * A v4 UUID for a new shape.
+ *
+ * crypto.randomUUID() only exists in a secure context, so it is undefined when
+ * the app is opened over plain http on a LAN address - a phone on the same
+ * wifi, say. getRandomValues works everywhere, so the fallback builds the same
+ * thing by hand rather than letting ids come out undefined.
+ */
 function newId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -47,6 +66,22 @@ function newId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * Game
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * One board: the shapes on it, the socket that syncs them, and the mouse.
+ *
+ * Deliberately framework-free - React owns *what* the settings are (tool,
+ * colour, theme) and pushes them in through setters; this class owns the
+ * drawing. It never reads React state and never calls back into it, with one
+ * exception: text needs a real DOM editor, so React registers a callback.
+ *
+ * Rendering is immediate-mode: there are no retained objects, only a list of
+ * shapes and a full repaint. So anything that changes what should be on screen
+ * has to call repaint() - the browser will not do it for you.
+ */
 export class Game {
   /* ── canvas ─────────────────────────────────────────────────────────── */
   private canvas: HTMLCanvasElement;
@@ -78,7 +113,8 @@ export class Game {
   private lastErasePoint: Point | null = null;
   /** the cursor, tracked while the eraser is active so its reach can be drawn */
   private cursor: Point | null = null;
-
+  /** the text shape open in the editor, hidden from the canvas until it closes */
+  private editingId: string | null = null;
   /* ── the appear animation ───────────────────────────────────────────── */
   /** shape id -> when it appeared, so a fading pad can be drawn behind it */
   private appearing: Map<string, number> = new Map();
@@ -88,7 +124,7 @@ export class Game {
   socket: WebSocket;
 
   /** set by React; asks it to open a text editor at a point. See setOnTextRequest. */
-  private onTextRequest: ((at: Point) => void) | null = null;
+  private onTextRequest: ((req: TextRequest) => void) | null = null;
 
   /** set by React; shows a message to the person. See setOnNotice. */
   private onNotice: ((message: string, tone: "error" | "info" | "success") => void) | null = null;
@@ -154,7 +190,7 @@ export class Game {
    * A setter rather than a constructor argument, so a new callback identity
    * does not rebuild the board.
    */
-  setOnTextRequest(cb: (at: Point) => void) {
+  setOnTextRequest(cb: (req: TextRequest) => void) {
     this.onTextRequest = cb;
   }
 
@@ -210,13 +246,12 @@ export class Game {
    */
   clearCanvas() {
     this.renderer.clear(THEMES[this.theme].canvas);
-
     const now = performance.now();
-
+    
     this.existingShapes.forEach((shape) => {
+      if (shape.id === this.editingId) return;
       // stored colours are palette names now, but old rows hold raw hex
       const color = this.paintColor(shape.color);
-
       // a pad behind anything that just appeared, fading over APPEAR_MS
       const appearedAt = this.appearing.get(shape.id);
       if (appearedAt !== undefined) {
@@ -230,7 +265,6 @@ export class Game {
           this.renderer.highlight(b.left, b.top, b.right - b.left, b.bottom - b.top, color, alpha);
         }
       }
-
       if (shape.type === "rect") {
         this.renderer.rect(shape.x, shape.y, shape.width, shape.height, color);
       } else if (shape.type === "circle") {
@@ -246,9 +280,7 @@ export class Game {
         this.renderer.text(shape.x, shape.y, shape.text, color, shape.fontSize, shape.fontFamily);
       }
     });
-
-    // in-progress strokes from other users, in *their* colour, drawn last so
-    // they sit above the saved shapes
+    
     this.remoteStrokes.forEach((stroke) => {
       this.renderer.stroke(stroke.points, this.paintColor(stroke.color));
     });
@@ -350,10 +382,15 @@ export class Game {
           }
         } 
         else if(message.type === "update_shape") {
-
-        } 
+          this.existingShapes = this.existingShapes.map((s) =>
+            s.id === message.id ? ({ ...s, ...message.data, id: s.id, type: s.type } as Shape) : s
+          );
+          this.clearCanvas();
+        }
         else if(message.type === "delete_shape") {
-
+          this.existingShapes = this.existingShapes.filter((s) => s.id !== message.id);
+          this.shapeIds.delete(message.id);
+          this.clearCanvas();
         }
         else if (message.type === "clear_room") {
           this.existingShapes = [];
@@ -361,6 +398,8 @@ export class Game {
           this.remoteStrokes.clear();
           this.clearCanvas();
         } else if (message.type === "error") {
+          // the server refused something - a board you do not own, a shape it
+          // could not save. The person needs to see this, not the console.
           this.notify(message.message ?? "The server refused that action");
         }
       } catch (err) {
@@ -468,7 +507,17 @@ export class Game {
       color: this.currentColor,
     });
   }
-
+  editText(id:string, text:string) {
+    const shape = this.existingShapes.find((s) => s.id === id); 
+    if(!shape || shape.type!== "text") return
+    this.editingId = null;
+    if(text.trim() === "") return this.deleteShape(id);
+    this.updateShape({...shape, text})
+  }
+  endTextEdit() {
+    this.editingId = null;
+    this.clearCanvas();
+  }
   /* ══════════════════════════════════════════════════════════════════════
    * Pointer input
    * ══════════════════════════════════════════════════════════════════════ */
@@ -575,7 +624,16 @@ export class Game {
    */
   dblClickHandler = (e: MouseEvent) => {
     if (this.selectedTool !== "text") return;
-    this.onTextRequest?.(this.pointOf(e));
+    const at = this.pointOf(e);
+    const texts = this.existingShapes.filter((s) => s.type === "text");
+    const hit = hitTest(texts, at, 4);
+    if (hit && hit.type === "text") {
+    this.editingId = hit.id;
+    this.clearCanvas();                               // hide it while the editor is open
+    this.onTextRequest?.({ at: { x: hit.x, y: hit.y }, shape: hit });
+    } else {
+  this.onTextRequest?.({ at });
+}
   };
 
   /**

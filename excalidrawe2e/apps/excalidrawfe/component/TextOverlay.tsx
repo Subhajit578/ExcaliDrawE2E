@@ -2,12 +2,13 @@
 import { Point, LINE_HEIGHT } from "@/draw/renderer";
 import { useEffect, useRef, type KeyboardEvent } from "react";
 export default function TextOverlay( {
-    at, color, fontSize, fontFamily, onCommit, onCancel
+    at, color, fontSize, fontFamily, initialValue, onCommit, onCancel
 }: {
     at: Point; 
     color: string;
     fontSize: number;
     fontFamily: string;
+    initialValue?: string;
     onCommit: (value: string) => void;
     onCancel: () => void
 }) {
@@ -22,21 +23,20 @@ export default function TextOverlay( {
         el.style.height = `${el.scrollHeight}px`;
       };
     useEffect(() => {
-        textBox.current?.focus()
-        fit();
+      const el = textBox.current;
+      el?.focus()
+      fit();
+      el?.setSelectionRange(el.value.length, el.value.length);
     }, []); 
     const finish = (commit: boolean) => {
         if(finished.current) return;
         finished.current = true;
         const value  = textBox.current?.value ?? ""
-        if(commit && value.trim() !== "") onCommit(value)
+        if(commit) onCommit(value)
         else onCancel();
     }; 
     const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
         e.stopPropagation();
-        // Enter makes a new line, like any textarea. Saving happens when the
-        // editor loses focus - click anywhere, pick another tool, start a
-        // second text. Cmd/Ctrl+Enter is there for finishing without the mouse.
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.nativeEvent.isComposing) {
           e.preventDefault();
           finish(true);
@@ -49,12 +49,12 @@ export default function TextOverlay( {
         <textarea
           ref={textBox}
           rows={1}
+          defaultValue={initialValue}
           wrap="off"
           spellCheck={false}
           onInput={fit}
           onKeyDown={handleKeyDown}
           onBlur={() => finish(true)}
-          // Don't let the canvas underneath start a stroke or selection.
           onPointerDown={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
           style={{

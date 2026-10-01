@@ -36,3 +36,7 @@ yarn-error.log*
 # Misc
 .DS_Store
 *.pem
+
+# Local working notes for Claude Code, not part of the project
+CLAUDE.md
+.claude/

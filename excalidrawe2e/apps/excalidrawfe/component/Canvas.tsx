@@ -12,9 +12,10 @@ import {
   Minus,
   MoveUpRight,
   Type,
-  Eraser
+  Eraser,
+  SquareDashedMousePointerIcon
 } from "lucide-react";
-import { Game } from "@/draw/Game";
+import { Game, TextRequest } from "@/draw/Game";
 import TextOverlay from "./TextOverlay";
 import { makeNotice, ToastStack, type Notice } from "./Toast";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -28,11 +29,11 @@ import {
   COLOR_NAMES,
   DEFAULT_COLOR,
   THEMES,
+  resolveColor,
   type ColorName,
   type ThemeChoice,
 } from "@/draw/theme";
-
-export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text" | "eraser";
+export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text" | "eraser" |"mouse_selector";
 
 export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }) {
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -42,7 +43,7 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   // a palette name; the theme decides what it looks like
   const [selectedColor, setSelectedColor] = useState<ColorName>(DEFAULT_COLOR);
   // where the text editor is open, or null when there isn't one
-  const [editing, setEditing] = useState<Point | null>(null);
+  const [editing, setEditing] = useState<TextRequest | null>(null);
   // messages shown over the board: server refusals, load failures, confirmations
   const [notices, setNotices] = useState<Notice[]>([]);
   const [confirmingClear, setConfirmingClear] = useState(false);
@@ -118,22 +119,37 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
     >
       <canvas ref={canvasRef} width={size.w} height={size.h} />
 
-      {/* key: a second double click elsewhere gets a fresh editor rather than
-          one still holding the previous text in its own state */}
+      {/* key: each editor is a fresh instance. Reusing one would keep the
+          previous text (the textarea is uncontrolled, so defaultValue only
+          applies on mount) and the `finished` latch, which would make the
+          second editor silently refuse to commit. */}
       {editing && (
         <TextOverlay
-          key={`${editing.x}-${editing.y}`}
-          at={editing}
-          color={palette.colors[selectedColor]}
-          fontSize={DEFAULT_FONT_SIZE}
-          fontFamily={DEFAULT_FONT_FAMILY}
+          key={editing.shape?.id ?? `${editing.at.x}-${editing.at.y}`}
+          at={editing.at}
+          // an existing text keeps its own styling: editing must not restyle it
+          color={
+            editing.shape
+              ? resolveColor(editing.shape.color, theme)
+              : palette.colors[selectedColor]
+          }
+          fontSize={editing.shape?.fontSize ?? DEFAULT_FONT_SIZE}
+          fontFamily={editing.shape?.fontFamily ?? DEFAULT_FONT_FAMILY}
+          initialValue={editing.shape?.text}
           onCommit={(value) => {
-            // STEP 6 goes here: replace this log with
-            // game?.addText(editing, value.trim(), DEFAULT_FONT_SIZE, DEFAULT_FONT_FAMILY);
-            game?.addText(editing, value.trim(), DEFAULT_FONT_SIZE, DEFAULT_FONT_FAMILY);
+            if (editing.shape) {
+              // editText handles the empty case by deleting the shape
+              game?.editText(editing.shape.id, value);
+            } else if (value.trim() !== "") {
+              game?.addText(editing.at, value.trim(), DEFAULT_FONT_SIZE, DEFAULT_FONT_FAMILY);
+            }
             setEditing(null);
           }}
-          onCancel={() => setEditing(null)}
+          onCancel={() => {
+            // bring back the shape that was hidden while its editor was open
+            game?.endTextEdit();
+            setEditing(null);
+          }}
         />
       )}
 
@@ -262,6 +278,13 @@ function TopBar({
           activated={selectedTool === "eraser"}
           icon={<Eraser size={20} />}
           title="Eraser"
+          {...iconProps}
+        />
+        <IconButton
+          onClick={() => setSelectedTool("mouse_selector")}
+          activated={selectedTool === "mouse_selector"}
+          icon={<SquareDashedMousePointerIcon size={20} />}
+          title="mouse_selector"
           {...iconProps}
         />
       </div>
