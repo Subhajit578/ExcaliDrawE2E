@@ -1,7 +1,7 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
-import { ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
+import { SELECT_TOLERANCE, ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
 import { circleFromDrag, elbowPoints } from "./routing";
 import { boundsOf, hitTest } from "./hitTest";
 
@@ -119,7 +119,7 @@ export class Game {
   /** shape id -> when it appeared, so a fading pad can be drawn behind it */
   private appearing: Map<string, number> = new Map();
   private animationFrame: number | null = null;
-
+  private selectedId: string | null = null;
   /* ── networking ─────────────────────────────────────────────────────── */
   socket: WebSocket;
 
@@ -599,6 +599,12 @@ export class Game {
       // wherever the previous erase drag happened to end
       this.lastErasePoint = this.pointOf(e);
       this.eraseAt(this.pointOf(e));
+    } else if(this.selectedTool === "select") {
+      // a miss clears the selection rather than leaving the previous one
+      // outlined, so there is no early return here
+      const hit = hitTest(this.existingShapes, this.pointOf(e), SELECT_TOLERANCE);
+      this.selectedId = hit?.id ?? null
+      this.clearCanvas()
     }
     else if (this.selectedTool === "pencil") {
       this.currentStrokeId = newId();

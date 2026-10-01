@@ -13,7 +13,7 @@ import {
   MoveUpRight,
   Type,
   Eraser,
-  SquareDashedMousePointerIcon
+  MousePointer2
 } from "lucide-react";
 import { Game, TextRequest } from "@/draw/Game";
 import TextOverlay from "./TextOverlay";
@@ -33,7 +33,7 @@ import {
   type ColorName,
   type ThemeChoice,
 } from "@/draw/theme";
-export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text" | "eraser" |"mouse_selector";
+export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text" | "eraser" | "select";
 
 export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }) {
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -281,10 +281,10 @@ function TopBar({
           {...iconProps}
         />
         <IconButton
-          onClick={() => setSelectedTool("mouse_selector")}
-          activated={selectedTool === "mouse_selector"}
-          icon={<SquareDashedMousePointerIcon size={20} />}
-          title="mouse_selector"
+          onClick={() => setSelectedTool("select")}
+          activated={selectedTool === "select"}
+          icon={<MousePointer2 size={20} />}
+          title="Select"
           {...iconProps}
         />
       </div>

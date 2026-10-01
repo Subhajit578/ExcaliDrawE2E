@@ -27,7 +27,7 @@ export const DEFAULT_FONT_SIZE = 20;
  * visibly never touched.
  */
 export const ERASER_RADIUS = 12;
-
+export const SELECT_TOLERANCE = 6;
 /**
  * Family new text is created with.
  *
@@ -230,6 +230,17 @@ export class ShapeRenderer {
     this.ctx.lineTo(pointTo.x - headlen * Math.cos(angle - Math.PI / 6), pointTo.y - headlen * Math.sin(angle - Math.PI / 6));
     this.ctx.moveTo(pointTo.x, pointTo.y);
     this.ctx.lineTo(pointTo.x - headlen * Math.cos(angle + Math.PI / 6), pointTo.y - headlen * Math.sin(angle + Math.PI / 6));
+    this.ctx.stroke();
+  }
+  selectionBox(x: number, y: number, width : number, height: number, color: string) {
+    this.ctx.strokeStyle = color;
+    this.ctx.lineWidth = 1.5;
+    const left = width < 0 ? x + width : x;
+    const top = height < 0 ? y + height : y;
+    const w = Math.abs(width);
+    const h = Math.abs(height);
+    this.ctx.beginPath();
+    this.ctx.rect(left, top, w, h)
     this.ctx.stroke();
   }
 }
