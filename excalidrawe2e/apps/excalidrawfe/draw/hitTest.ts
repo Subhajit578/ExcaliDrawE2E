@@ -55,6 +55,101 @@ export function boundsOf(shape: Shape): Bounds {
         }
     }
 }
+/**
+ * The same shape, moved by (dx, dy).
+ *
+ * Returns a new object and never writes into the one passed in, so a drag can
+ * call it repeatedly against the pristine original it cloned at mousedown.
+ *
+ * A move is the same offset applied to every position a shape has: a circle
+ * has one (its centre), rect and text one (their top-left), and the three
+ * point-based types have as many as were drawn.
+ */
+/**
+ * The topmost shape whose *interior* contains the point, or null.
+ *
+ * hitTest matches outlines, which is right for the eraser and for grabbing a
+ * thin line - but it means a press in the middle of a rectangle hits nothing.
+ * Selecting is the one place where the inside of a shape should count, so this
+ * is tried as a fallback there.
+ *
+ * Closed shapes only. A pencil stroke, line or arrow has no inside, and
+ * treating its bounding box as one would swallow presses nowhere near it.
+ */
+export function hitTestInside(shapes: Shape[], point: Point): Shape | null {
+    for (let i = shapes.length - 1; i >= 0; i--) {
+        const shape = shapes[i];
+        if (!shape) continue;
+        if (shape.type === "rect") {
+            if (rectangleCollision(point, shape.x, shape.y, shape.width, shape.height, 0)) {
+                return shape;
+            }
+        } else if (shape.type === "circle") {
+            // the disc, not the ring: the bounding square would also match its
+            // corners, which are visibly outside the shape
+            if (Math.hypot(point.x - shape.centerX, point.y - shape.centerY) <= Math.abs(shape.radius)) {
+                return shape;
+            }
+        } else if (shape.type === "text") {
+            const b = boundsOf(shape);
+            if (point.x >= b.left && point.x <= b.right && point.y >= b.top && point.y <= b.bottom) {
+                return shape;
+            }
+        }
+    }
+    return null;
+}
+
+/** The box between two dragged corners, with the corners in any order. */
+export function boundsBetween(from: Point, to: Point): Bounds {
+    return {
+        left: Math.min(from.x, to.x),
+        right: Math.max(from.x, to.x),
+        top: Math.min(from.y, to.y),
+        bottom: Math.max(from.y, to.y),
+    };
+}
+
+/**
+ * Every shape whose box overlaps `area`, in list order.
+ *
+ * Touching counts: a marquee that clips the edge of a shape selects it, which
+ * is what Excalidraw does and is far more forgiving than requiring a shape to
+ * be enclosed completely.
+ */
+export function shapesInBounds(shapes: Shape[], area: Bounds): Shape[] {
+    return shapes.filter((shape) => {
+        const b = boundsOf(shape);
+        return (
+            b.left <= area.right &&
+            b.right >= area.left &&
+            b.top <= area.bottom &&
+            b.bottom >= area.top
+        );
+    });
+}
+
+export function translate(shape: Shape, dx: number, dy: number): Shape {
+    if (shape.type === "circle") {
+        // a circle is positioned entirely by its centre - the radius does not
+        // move, so a spread of the flat number fields is a complete copy
+        return { ...shape, centerX: shape.centerX + dx, centerY: shape.centerY + dy };
+    }
+    if(shape.type === "rect" || shape.type ==="text") {
+        return {...shape, x:shape.x+dx, y:shape.y+dy };
+    }
+    if(shape.type=== "pencil" || shape.type === "line" || shape.type === "arrow") {
+       const points:Point[] = shape.points
+       const newPoints = points.map((p) => ({
+        x:p.x+ dx,
+        y:p.y+dy
+       }))
+       return {...shape, points:newPoints}
+    }
+
+    return shape;
+}
+
 export function hitTest(shapes: Shape[], point: Point, tolerance: number) : Shape | null {
     let hit = false;
     for (let i = shapes.length - 1; i >= 0; i--) {

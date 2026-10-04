@@ -225,7 +225,7 @@ wss.on("connection" , function(socket,request){
                 return;
             }
             if (typeof data !== "object" || data === null || Array.isArray(data)) {
-                socket.send(JSON.stringify({ type: "error", message: "Shape update is missing its data" }));
+                socket.send(JSON.stringify({ type: "error", message: "Shape update is missing its data", id }));
                 return;
             }
             const updated = await withDb(() =>  prismaClient.shape.updateMany({
@@ -235,7 +235,9 @@ wss.on("connection" , function(socket,request){
                 data : { data}
             }))
             if (updated.count === 0) {
-                socket.send(JSON.stringify({ type: "error", message: "That shape no longer exists" }));
+                // id included so the sender can revert its optimistic change:
+                // without it the client cannot tell which shape was refused
+                socket.send(JSON.stringify({ type: "error", message: "That shape no longer exists", id }));
                 return;
             }
         

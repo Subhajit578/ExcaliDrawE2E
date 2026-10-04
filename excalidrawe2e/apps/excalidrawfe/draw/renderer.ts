@@ -1,3 +1,4 @@
+import { Shape } from "./Game";
 export type Point = { x: number; y: number };
 
 /**
@@ -232,15 +233,45 @@ export class ShapeRenderer {
     this.ctx.lineTo(pointTo.x - headlen * Math.cos(angle + Math.PI / 6), pointTo.y - headlen * Math.sin(angle + Math.PI / 6));
     this.ctx.stroke();
   }
-  selectionBox(x: number, y: number, width : number, height: number, color: string) {
+  /**
+   * The rubber-band rectangle dragged across empty canvas.
+   *
+   * Filled as well as stroked, unlike a selection outline: the fill is what
+   * makes it read as an area being swept rather than a shape being drawn.
+   */
+  marquee(x: number, y: number, width: number, height: number, color: string) {
+    const left = width < 0 ? x + width : x;
+    const top = height < 0 ? y + height : y;
+    const w = Math.abs(width);
+    const h = Math.abs(height);
+
+    this.ctx.save();
     this.ctx.strokeStyle = color;
-    this.ctx.lineWidth = 1.5;
+    this.ctx.fillStyle = color;
+    this.ctx.lineWidth = 1;
+    this.ctx.setLineDash([4, 4]);
+    this.ctx.globalAlpha = 0.12;
+    this.ctx.fillRect(left, top, w, h);
+    this.ctx.globalAlpha = 1;
+    this.ctx.beginPath();
+    this.ctx.rect(left, top, w, h);
+    this.ctx.stroke();
+    this.ctx.restore();
+  }
+
+  selectionBox(x: number, y: number, width : number, height: number, color: string) {
+    this.ctx.save();
+    const PAD = 4;
+    this.ctx.strokeStyle = color;
+    this.ctx.lineWidth = 0.8;
     const left = width < 0 ? x + width : x;
     const top = height < 0 ? y + height : y;
     const w = Math.abs(width);
     const h = Math.abs(height);
     this.ctx.beginPath();
-    this.ctx.rect(left, top, w, h)
+    this.ctx.setLineDash([4,4]);
+    this.ctx.rect(left- PAD, top -PAD, w+PAD*2, h+PAD*2)
     this.ctx.stroke();
+    this.ctx.restore()
   }
 }

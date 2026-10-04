@@ -1,5 +1,5 @@
 import type { Point } from "./renderer";
-
+import { Shape } from "./Game";
 /**
  * A drag shorter than this on either axis counts as straight: an elbow there
  * would leave a stub of a few pixels, which reads as a rendering glitch rather
