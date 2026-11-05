@@ -3,7 +3,22 @@ import { getExistingShapes } from "./http";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 import { SELECT_TOLERANCE, ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
 import { circleFromDrag, elbowPoints } from "./routing";
-import { boundsBetween, boundsOf, hitTest, hitTestInside, shapesInBounds, translate } from "./hitTest";
+import {
+  boundsBetween,
+  boundsOf,
+  boundsUnion,
+  handleAt,
+  handlesOf,
+  hitTest,
+  hitTestInside,
+  OPPOSITE,
+  scale,
+  scaleFactors,
+  shapesInBounds,
+  translate,
+  type Bounds,
+  type Corner,
+} from "./hitTest";
 
 /** how long a newly drawn shape keeps its fading pad, in ms */
 const APPEAR_MS = 450;
@@ -155,6 +170,23 @@ export class Game {
    * no drag is in progress.
    */
   private dragOriginals: Map<string, Shape> = new Map();
+  /**
+   * The resize in progress, or null when no handle is being dragged.
+   *
+   * Mirrors dragOriginals: a deep clone so scaling never writes through to the
+   * shape on the board, and every frame recomputes from it rather than
+   * compounding per-frame factors. `anchor` is the opposite corner's position,
+   * captured once at mousedown - recomputing it from the shrinking shape would
+   * make it chase the cursor.
+   */
+  private resizing: {
+    /** every selected shape as it was when the grip was grabbed */
+    originals: Map<string, Shape>;
+    corner: Corner;
+    anchor: Point;
+    /** the selection's box at that moment, which the scale factors divide by */
+    bounds: Bounds;
+  } | null = null;
   /**
    * The rubber band being dragged across empty canvas, or null.
    *
@@ -363,6 +395,13 @@ export class Game {
         );
       }
       for (const id of gone) this.forgetShape(id);
+
+      // one set of grips for the whole selection, around the union of the
+      // outlines above - a group resizes as a single object
+      const bounds = this.selectionBounds();
+      if (bounds) {
+        this.renderer.handles(handlesOf(bounds), THEMES[this.theme].accent);
+      }
     }
 
     // the rubber band, over the outlines it is about to replace
@@ -484,7 +523,10 @@ export class Game {
           // it would visibly oscillate between the two. Theirs is dropped, so
           // our release is the last write the server stores - last writer
           // wins, not a merge.
-          if (this.dragOriginals.has(message.id)) {
+          if (
+            this.dragOriginals.has(message.id) ||
+            this.resizing?.originals.has(message.id)
+          ) {
             return;
           }
           this.existingShapes = this.existingShapes.map((s) =>
@@ -511,6 +553,7 @@ export class Game {
           this.selectedIds.clear();
           this.dragOriginals.clear();
           this.marquee = null;
+          this.resizing = null;
           this.pendingUpdates.clear();
           this.clearCanvas();
         } else if (message.type === "error") {
@@ -650,6 +693,9 @@ export class Game {
   private forgetShape(id: string) {
     this.selectedIds.delete(id);
     this.dragOriginals.delete(id);
+    // a resize of a selection one of whose shapes has gone would scale from a
+    // box that no longer describes it
+    if (this.resizing?.originals.has(id)) this.resizing = null;
     this.pendingUpdates.delete(id);
   }
 
@@ -677,6 +723,29 @@ export class Game {
       }
     }
     return false;
+  }
+
+  /**
+   * The box around everything selected, or null when nothing is.
+   *
+   * One box for the whole selection, so twenty shapes resize as one object
+   * rather than each about its own corner.
+   */
+  private selectionBounds(): Bounds | null {
+    if (this.selectedIds.size === 0) return null;
+    return boundsUnion(this.existingShapes.filter((s) => this.selectedIds.has(s.id)));
+  }
+
+  /**
+   * The corner of the grip under a point, or null.
+   *
+   * Reads the selection's box, so it answers for a group exactly as it does
+   * for one shape.
+   */
+  private hoveredHandle(point: Point): Corner | null {
+    const bounds = this.selectionBounds();
+    if (!bounds) return null;
+    return handleAt(bounds, point)?.corner ?? null;
   }
 
   /** Snapshot every selected shape, so a drag can be computed from originals. */
@@ -819,6 +888,33 @@ export class Game {
       this.lastErasePoint = this.pointOf(e);
       this.eraseAt(this.pointOf(e));
     } else if(this.selectedTool === "select") {
+      // Handles first, before any shape test. A grip sits on the outline, so
+      // the shape's own hit test would claim the press and start a move -
+      // order is what decides which gesture you get.
+      const selectionBox = this.selectionBounds();
+      const handle = selectionBox ? handleAt(selectionBox, this.pointOf(e)) : null;
+      if (selectionBox && handle) {
+        const opposite = handlesOf(selectionBox).find(
+          (c) => c.corner === OPPOSITE[handle.corner]
+        )!;
+        const originals = new Map<string, Shape>();
+        for (const shape of this.existingShapes) {
+          // deep, for the same reason a drag clones: the three point-based
+          // types would otherwise share their points array with the board
+          if (this.selectedIds.has(shape.id)) {
+            originals.set(shape.id, structuredClone(shape));
+          }
+        }
+        this.resizing = {
+          originals,
+          corner: handle.corner,
+          anchor: { x: opposite.x, y: opposite.y },
+          bounds: selectionBox,
+        };
+        this.clearCanvas();
+        return;
+      }
+
       // outline first, then the inside: pressing in the middle of a rectangle
       // is a grab, not the start of a rubber band
       const hit =
@@ -910,11 +1006,28 @@ export class Game {
     // shapes nobody is dragging.
     const dragged = this.dragOriginals;
     const marquee = this.marquee;
+    const resizing = this.resizing;
     this.dragOriginals = new Map();
     this.marquee = null;
+    this.resizing = null;
     if (!wasClicked) return;
 
     if (this.selectedTool === "select") {
+      if (resizing) {
+        // a press on a grip that never moved changed nothing, and a write per
+        // click would be a row update for every missed grab
+        if (e.clientX !== this.startX || e.clientY !== this.startY) {
+          const { originals, corner, anchor, bounds } = resizing;
+          const { sx, sy } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
+          // one message per shape: the protocol has no batch form, so resizing
+          // ten shapes is ten update_shape frames on release
+          for (const original of originals.values()) {
+            this.updateShape(scale(original, anchor, sx, sy));
+          }
+        }
+        return;
+      }
+
       if (marquee) {
         // a sweep that never moved is just a click on empty canvas, which has
         // already cleared the selection in mousedown
@@ -1041,8 +1154,22 @@ export class Game {
     // with the select tool, the cursor is the only hint that a shape can be
     // picked up - there are no handles on it yet
     if (this.selectedTool === "select") {
-      if (this.dragOriginals.size > 0) {
+      if (this.resizing) {
+        // read from where the cursor is now, not from the corner that was
+        // grabbed: dragging through the anchor turns an se grip into a sw one,
+        // and the arrow has to turn with it
+        const dx = e.clientX - this.resizing.anchor.x;
+        const dy = e.clientY - this.resizing.anchor.y;
+        this.canvas.style.cursor =
+          dx >= 0 === dy >= 0 ? "nwse-resize" : "nesw-resize";
+      } else if (this.dragOriginals.size > 0) {
         this.canvas.style.cursor = "grabbing";
+      } else if (this.hoveredHandle(this.pointOf(e))) {
+        // the diagonal the grip moves along: nw and se share one, ne and sw
+        // the other
+        const corner = this.hoveredHandle(this.pointOf(e))!;
+        this.canvas.style.cursor =
+          corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize";
       } else {
         const over =
           hitTest(this.existingShapes, this.pointOf(e), SELECT_TOLERANCE) ??
@@ -1050,6 +1177,23 @@ export class Game {
         this.canvas.style.cursor =
           over || this.pointInSelection(this.pointOf(e)) ? "grab" : "default";
       }
+    }
+
+    // a resize in progress: the anchor is fixed and the cursor is the corner
+    // being dragged, so the two define the new box
+    if (this.clicked && this.resizing) {
+      const { originals, corner, anchor, bounds } = this.resizing;
+      // one pair of factors for the whole selection, from the box as it was at
+      // mousedown - computing them from the shrinking box each frame would
+      // compound, and the shapes would run away from the cursor
+      const { sx, sy } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
+      const resized: Shape[] = [];
+      for (const original of originals.values()) {
+        resized.push(scale(original, anchor, sx, sy));
+      }
+      // local only - the new geometry goes out once, on mouseup
+      this.applyShapes(resized);
+      return;
     }
 
     // a drag in progress: recompute every position from the originals and the

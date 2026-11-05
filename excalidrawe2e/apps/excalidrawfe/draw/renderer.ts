@@ -1,4 +1,5 @@
 import { Shape } from "./Game";
+import { Handle } from "./hitTest";
 export type Point = { x: number; y: number };
 
 /**
@@ -29,6 +30,7 @@ export const DEFAULT_FONT_SIZE = 20;
  */
 export const ERASER_RADIUS = 12;
 export const SELECT_TOLERANCE = 6;
+export const HANDLE_SIZE = 8;
 /**
  * Family new text is created with.
  *
@@ -273,5 +275,18 @@ export class ShapeRenderer {
     this.ctx.rect(left- PAD, top -PAD, w+PAD*2, h+PAD*2)
     this.ctx.stroke();
     this.ctx.restore()
+  }
+  handles(points: Handle[], color: string) {
+    this.ctx.save();
+    this.ctx.fillStyle = color;
+    this.ctx.strokeStyle = color;
+    this.ctx.lineWidth = 1;
+    this.ctx.setLineDash([]);
+    const half = HANDLE_SIZE / 2;
+    for (const p of points) {
+      this.ctx.fillRect(p.x - half, p.y - half, HANDLE_SIZE, HANDLE_SIZE);
+    }
+
+    this.ctx.restore();
   }
 }

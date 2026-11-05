@@ -2,7 +2,14 @@ import { LINE_HEIGHT, Point } from "./renderer";
 import { Shape } from "./Game";
 
 export type Bounds = { left: number; top: number; right: number; bottom: number };
-
+export type Corner = "nw" | "ne" | "se" | "sw";
+export type Handle = { corner: Corner; x: number; y: number };
+export const OPPOSITE: Record<Corner, Corner> = {
+    nw: "se",
+    ne: "sw",
+    se: "nw",
+    sw: "ne",
+};
 /**
  * The box a shape occupies on screen.
  *
@@ -55,6 +62,219 @@ export function boundsOf(shape: Shape): Bounds {
         }
     }
 }
+export function handlesOf(bounds: Bounds): Handle[] {
+    return [
+        { corner: "nw", x: bounds.left,  y: bounds.top },
+        { corner: "ne", x: bounds.right, y: bounds.top },
+        { corner: "se", x: bounds.right, y: bounds.bottom },
+        { corner: "sw", x: bounds.left,  y: bounds.bottom },
+    ];
+}
+
+/**
+ * The box containing every shape given, or null when given none.
+ *
+ * One selection of twenty shapes resizes as one object, so the handles and the
+ * scale factors come from this rather than from any single shape.
+ */
+export function boundsUnion(shapes: Shape[]): Bounds | null {
+    if (shapes.length === 0) return null;
+    let union: Bounds | null = null;
+    for (const shape of shapes) {
+        const b = boundsOf(shape);
+        union = union === null ? { ...b } : {
+            left: Math.min(union.left, b.left),
+            top: Math.min(union.top, b.top),
+            right: Math.max(union.right, b.right),
+            bottom: Math.max(union.bottom, b.bottom),
+        };
+    }
+    return union;
+}
+/**
+ * How far from a corner still counts as grabbing its handle, in pixels.
+ *
+ * Deliberately wider than half of HANDLE_SIZE. A press that misses a grip does
+ * not do nothing - it lands inside the selection, which starts a *move*, so a
+ * near miss silently drags the shape instead of resizing it. Being generous
+ * here is what stops that. It also covers the gap left by the selection
+ * outline's own padding, which puts the visible corner a few pixels outside
+ * the grip drawn on it.
+ */
+const HANDLE_GRAB = 12;
+
+/**
+ * The handle under a point, or null.
+ *
+ * A square test, because a square is what gets drawn, sized by HANDLE_GRAB
+ * rather than by the square itself: a grip you have to hit exactly is
+ * miserable to use, and the slop costs nothing because handles sit at the
+ * corners of a box rather than packed together.
+ *
+ * On a very small shape the four grips overlap and a press satisfies more than
+ * one test; the first match wins, which the minimum size in resizeShape keeps
+ * rare.
+ */
+export function handleAt(bounds: Bounds, point: Point): Handle | null {
+    for (const handle of handlesOf(bounds)) {
+        const grab = HANDLE_GRAB;
+        if (Math.abs(point.x - handle.x) <= grab && Math.abs(point.y - handle.y) <= grab) {
+            return handle;
+        }
+    }
+    return null;
+}
+
+/**
+ * A shape can never be scaled below this, in pixels.
+ *
+ * Without a floor, dragging a handle past the anchor collapses a shape to a
+ * dot whose own handles are then too small to grab - unrecoverable without
+ * deleting it and starting again.
+ */
+const MIN_SIZE = 8;
+
+/**
+ * The same shape, scaled about `anchor` by (sx, sy).
+ *
+ * Scaling about a point is three steps folded into one line per coordinate:
+ * shift so the anchor is the origin, multiply, shift back.
+ *
+ *     p' = anchor + (p - anchor) * s
+ *
+ * Returns a new object and never writes into the one passed in, so a resize
+ * can call it repeatedly against the pristine original cloned at mousedown -
+ * recomputing from the original each frame rather than compounding per-frame
+ * factors, which would drift.
+ */
+/**
+ * One scale factor for shapes that cannot stretch - a circle and a text.
+ *
+ * `factor` is the magnitude both axes agree on; `fx` and `fy` carry it back
+ * with each axis's own sign, so a mirrored drag still mirrors. Position and
+ * size must both be built from these, or the corner meant to stay pinned
+ * drifts and the shape appears to move while being resized.
+ */
+function uniform(sx: number, sy: number): { fx: number; fy: number; factor: number } {
+    const factor = Math.min(Math.abs(sx), Math.abs(sy));
+    return {
+        fx: (sx < 0 ? -1 : 1) * factor,
+        fy: (sy < 0 ? -1 : 1) * factor,
+        factor,
+    };
+}
+
+export function scale(shape: Shape, anchor: Point, sx: number, sy: number): Shape {
+    const sizeX = (x: number) => anchor.x + (x - anchor.x) * sx;
+    const sizeY = (y: number) => anchor.y + (y - anchor.y) * sy;
+
+    if (shape.type === "circle") {
+        // centerX/centerY/radius cannot describe an ellipse, so a non-uniform
+        // drag has nowhere to go: the smaller factor wins, which keeps the
+        // circle inside the box being dragged rather than spilling out of it.
+        // True two-axis resizing would mean storing radiusX and radiusY.
+        //
+        // Both the centre and the radius must use that one factor. Moving the
+        // centre by sx/sy while sizing the radius by the smaller of the two
+        // makes the anchored corner drift, so the circle slides away from the
+        // corner that is supposed to be pinned.
+        const { fx, fy, factor } = uniform(sx, sy);
+        return {
+            ...shape,
+            centerX: anchor.x + (shape.centerX - anchor.x) * fx,
+            centerY: anchor.y + (shape.centerY - anchor.y) * fy,
+            radius: Math.abs(shape.radius) * factor,
+        };
+    }
+    if (shape.type === "rect") {
+        return {
+            ...shape,
+            x: sizeX(shape.x),
+            y: sizeY(shape.y),
+            width: shape.width * sx,
+            height: shape.height * sy,
+        };
+    }
+    if (shape.type === "text") {
+        // the glyphs scale, they do not stretch: a font has one size, which is
+        // why fontSize is stored per shape. One factor for both axes, so the
+        // box will not track the cursor exactly - text dimensions come from
+        // font metrics, not from the drag.
+        // Same one-factor rule as the circle, and for the same reason: sizing
+        // the glyphs by one number while placing them with another lets the
+        // anchored corner drift.
+        const { fx, fy, factor } = uniform(sx, sy);
+        const b = boundsOf(shape);
+        const mapX = (x: number) => anchor.x + (x - anchor.x) * fx;
+        const mapY = (y: number) => anchor.y + (y - anchor.y) * fy;
+        // x,y is the top-left corner the glyphs run from, and glyphs cannot be
+        // mirrored. Under a negative factor the box's two edges swap, so the
+        // smaller mapped edge is taken rather than assuming x stays leftmost -
+        // otherwise a flipped text would run off in the wrong direction.
+        return {
+            ...shape,
+            x: Math.min(mapX(b.left), mapX(b.right)),
+            y: Math.min(mapY(b.top), mapY(b.bottom)),
+            fontSize: Math.max(1, shape.fontSize * factor),
+        };
+    }
+    // pencil, line and arrow: every point moves, the same way
+    return {
+        ...shape,
+        points: shape.points.map((p) => ({ x: sizeX(p.x), y: sizeY(p.y) })),
+    };
+}
+
+/**
+ * How much to scale, so that the dragged corner lands on `to` while the
+ * opposite corner stays put.
+ *
+ * Factors rather than a finished shape, because a group resize applies the
+ * same pair to every member: the box belongs to the selection, not to any one
+ * shape. The degenerate cases are handled here so the mouse handler stays a
+ * mouse handler.
+ */
+export function scaleFactors(
+    bounds: Bounds,
+    corner: Corner,
+    anchor: Point,
+    to: Point
+): { sx: number; sy: number } {
+    // Where the grabbed corner started, relative to the anchor. This is the
+    // divisor, and its SIGN is the whole point: grabbing "nw" puts the corner
+    // left of and above its anchor, so the offset is negative on both axes.
+    // Dividing by a plain width instead would invert every drag from nw, ne
+    // and sw - the shape would mirror the instant it was touched, stretching
+    // away from the cursor.
+    const grabbed = handlesOf(bounds).find((h) => h.corner === corner)!;
+    // A zero-width box - a vertical line, a single-point stroke - would give an
+    // infinite or NaN factor, and NaN coordinates render as nothing at all,
+    // silently. Flooring the magnitude keeps the shape visible and scalable.
+    const fromX = atLeast(grabbed.x - anchor.x, 1);
+    const fromY = atLeast(grabbed.y - anchor.y, 1);
+
+    return {
+        sx: atLeast(to.x - anchor.x, MIN_SIZE) / fromX,
+        sy: atLeast(to.y - anchor.y, MIN_SIZE) / fromY,
+    };
+}
+
+/**
+ * `delta` with its sign kept and its magnitude floored at `min`.
+ *
+ * Keeping the sign is what lets a handle be dragged *through* its anchor and
+ * out the far side: numerator and divisor then disagree, the factor goes
+ * negative, and the shape mirrors rather than stopping dead at the anchor.
+ * The floor means crossing over passes through a small shape instead of a
+ * zero-sized one that could never be grabbed again.
+ *
+ * Exactly zero has no sign to preserve, so it is treated as positive.
+ */
+function atLeast(delta: number, min: number): number {
+    const sign = delta < 0 ? -1 : 1;
+    return sign * Math.max(Math.abs(delta), min);
+}
+
 /**
  * The same shape, moved by (dx, dy).
  *
