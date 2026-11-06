@@ -2,14 +2,86 @@ import { LINE_HEIGHT, Point } from "./renderer";
 import { Shape } from "./Game";
 
 export type Bounds = { left: number; top: number; right: number; bottom: number };
-export type Corner = "nw" | "ne" | "se" | "sw";
+/**
+ * A grip on the selection box: four corners and four edge midpoints.
+ *
+ * Corners change both axes at once; edges change one and leave the other
+ * exactly as it was. Dragging a corner "straight across" is never quite
+ * straight, so stretching only the width is a thing you cannot do without
+ * them.
+ */
+export type Corner = "nw" | "ne" | "se" | "sw" | "n" | "e" | "s" | "w";
 export type Handle = { corner: Corner; x: number; y: number };
+
+/**
+ * A shape can never be scaled below this, in pixels.
+ *
+ * Without a floor, dragging a handle past the anchor collapses a shape to a
+ * dot whose own handles are then too small to grab - unrecoverable without
+ * deleting it and starting again.
+ */
+const MIN_SIZE = 8;
+/** The grip that stays put while another is dragged. */
 export const OPPOSITE: Record<Corner, Corner> = {
     nw: "se",
     ne: "sw",
     se: "nw",
     sw: "ne",
+    n: "s",
+    s: "n",
+    e: "w",
+    w: "e",
 };
+/**
+ * A shape with its coordinates rounded to whole pixels.
+ *
+ * Scaling multiplies by a ratio, so a resize that should land on 460 arrives
+ * as 459.9999999999999 and is stored that way. It renders identically - the
+ * canvas works in floats - but it reaches the database, the wire and every
+ * collaborator, and it makes stored geometry awkward to read or compare.
+ *
+ * Applied where geometry is committed rather than inside scale(), so the
+ * frames of a drag stay smooth: rounding every intermediate frame would make
+ * a slow resize move in visible steps.
+ */
+export function roundShape(shape: Shape): Shape {
+    const r = Math.round;
+    if (shape.type === "circle") {
+        return { ...shape, centerX: r(shape.centerX), centerY: r(shape.centerY), radius: r(shape.radius) };
+    }
+    if (shape.type === "rect" || shape.type === "image") {
+        return { ...shape, x: r(shape.x), y: r(shape.y), width: r(shape.width), height: r(shape.height) };
+    }
+    if (shape.type === "text") {
+        // fontSize keeps one decimal: whole pixels are too coarse a step for
+        // type, and a half-point difference is visible at small sizes
+        return {
+            ...shape,
+            x: r(shape.x),
+            y: r(shape.y),
+            fontSize: Math.round(shape.fontSize * 10) / 10,
+        };
+    }
+    return { ...shape, points: shape.points.map((p) => ({ x: r(p.x), y: r(p.y) })) };
+}
+
+/**
+ * Whether a shape is too small to be worth keeping.
+ *
+ * A click with a drawing tool is a drag of zero length, which produces a
+ * zero-sized shape: invisible, but a real row in the database and a real entry
+ * in the z-order, sitting above everything drawn before it and swallowing
+ * clicks at that point. The damage is entirely out of proportion to the
+ * mistake, so these are dropped rather than committed.
+ *
+ * Measured on the bounding box, so it covers every type at once - including a
+ * pencil "stroke" of a single point.
+ */
+export function isDegenerate(shape: Shape): boolean {
+    const b = boundsOf(shape);
+    return b.right - b.left < MIN_SIZE && b.bottom - b.top < MIN_SIZE;
+}
+
 /**
  * The box a shape occupies on screen.
  *
@@ -38,6 +110,17 @@ export function boundsOf(shape: Shape): Bounds {
                 bottom: shape.centerY + r,
             };
         }
+        case "image": {
+            // width and height are signed only in theory - images are placed,
+            // not dragged out - but normalising costs nothing and keeps a
+            // flipped resize from producing an inside-out box
+            return {
+                left: Math.min(shape.x, shape.x + shape.width),
+                right: Math.max(shape.x, shape.x + shape.width),
+                top: Math.min(shape.y, shape.y + shape.height),
+                bottom: Math.max(shape.y, shape.y + shape.height),
+            };
+        }
         case "text": {
             const lineCount = shape.text.split("\n").length;
             return {
@@ -63,11 +146,19 @@ export function boundsOf(shape: Shape): Bounds {
     }
 }
 export function handlesOf(bounds: Bounds): Handle[] {
+    const midX = (bounds.left + bounds.right) / 2;
+    const midY = (bounds.top + bounds.bottom) / 2;
+    // corners first: on a small shape the grips overlap, and handleAt returns
+    // the first match, so the two-axis grip should win over the one-axis one
     return [
         { corner: "nw", x: bounds.left,  y: bounds.top },
         { corner: "ne", x: bounds.right, y: bounds.top },
         { corner: "se", x: bounds.right, y: bounds.bottom },
         { corner: "sw", x: bounds.left,  y: bounds.bottom },
+        { corner: "n",  x: midX,         y: bounds.top },
+        { corner: "s",  x: midX,         y: bounds.bottom },
+        { corner: "w",  x: bounds.left,  y: midY },
+        { corner: "e",  x: bounds.right, y: midY },
     ];
 }
 
@@ -125,14 +216,6 @@ export function handleAt(bounds: Bounds, point: Point): Handle | null {
     return null;
 }
 
-/**
- * A shape can never be scaled below this, in pixels.
- *
- * Without a floor, dragging a handle past the anchor collapses a shape to a
- * dot whose own handles are then too small to grab - unrecoverable without
- * deleting it and starting again.
- */
-const MIN_SIZE = 8;
 
 /**
  * The same shape, scaled about `anchor` by (sx, sy).
@@ -186,7 +269,11 @@ export function scale(shape: Shape, anchor: Point, sx: number, sy: number): Shap
             radius: Math.abs(shape.radius) * factor,
         };
     }
-    if (shape.type === "rect") {
+    if (shape.type === "rect" || shape.type === "image") {
+        // per-axis, unlike text: an image has real pixels to stretch, and
+        // drawImage will happily squash them. Constraining to the aspect ratio
+        // would be friendlier, but it would also make an image the only shape
+        // whose corner does not follow the cursor.
         return {
             ...shape,
             x: sizeX(shape.x),
@@ -250,12 +337,17 @@ export function scaleFactors(
     // A zero-width box - a vertical line, a single-point stroke - would give an
     // infinite or NaN factor, and NaN coordinates render as nothing at all,
     // silently. Flooring the magnitude keeps the shape visible and scalable.
-    const fromX = atLeast(grabbed.x - anchor.x, 1);
-    const fromY = atLeast(grabbed.y - anchor.y, 1);
+    const spanX = grabbed.x - anchor.x;
+    const spanY = grabbed.y - anchor.y;
 
     return {
-        sx: atLeast(to.x - anchor.x, MIN_SIZE) / fromX,
-        sy: atLeast(to.y - anchor.y, MIN_SIZE) / fromY,
+        // An edge grip sits directly above, below or beside its anchor, so on
+        // the axis it does not move along the span is zero. That axis is not
+        // being resized at all - it must come back as exactly 1, not as a
+        // division by a floored span, which would quietly rescale the side the
+        // person was holding still.
+        sx: spanX === 0 ? 1 : atLeast(to.x - anchor.x, MIN_SIZE) / spanX,
+        sy: spanY === 0 ? 1 : atLeast(to.y - anchor.y, MIN_SIZE) / spanY,
     };
 }
 
@@ -310,7 +402,10 @@ export function hitTestInside(shapes: Shape[], point: Point): Shape | null {
             if (Math.hypot(point.x - shape.centerX, point.y - shape.centerY) <= Math.abs(shape.radius)) {
                 return shape;
             }
-        } else if (shape.type === "text") {
+        } else if (shape.type === "text" || shape.type === "image") {
+            // both are solid rectangles: unlike a stroked shape there is no
+            // outline to aim at, and clicking the middle of a photo obviously
+            // means that photo
             const b = boundsOf(shape);
             if (point.x >= b.left && point.x <= b.right && point.y >= b.top && point.y <= b.bottom) {
                 return shape;
@@ -355,7 +450,7 @@ export function translate(shape: Shape, dx: number, dy: number): Shape {
         // move, so a spread of the flat number fields is a complete copy
         return { ...shape, centerX: shape.centerX + dx, centerY: shape.centerY + dy };
     }
-    if(shape.type === "rect" || shape.type ==="text") {
+    if(shape.type === "rect" || shape.type ==="text" || shape.type === "image") {
         return {...shape, x:shape.x+dx, y:shape.y+dy };
     }
     if(shape.type=== "pencil" || shape.type === "line" || shape.type === "arrow") {
@@ -395,8 +490,18 @@ export function hitTest(shapes: Shape[], point: Point, tolerance: number) : Shap
         if(hit ===true) {
             return shape
         } 
-    } 
+    }
+    else if (shape.type === "image") {
+        // solid, not an outline: an image is opaque pixels, so touching any
+        // part of it counts - for the eraser as much as for selection
+        hit = rectangleCollision(point, shape.x, shape.y, shape.width, shape.height, tolerance)
+        if (hit === true) {
+            return shape
+        }
+    }
     else {
+        // pencil, line and arrow - the only types left, and the only ones with
+        // a points array
         const pts = shape.points;
         for (let j = 1; j < pts.length; j++) {
             if (segmentCollision(pts[j - 1], pts[j], point, tolerance)) {

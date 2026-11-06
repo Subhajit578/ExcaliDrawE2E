@@ -13,7 +13,8 @@ import {
   MoveUpRight,
   Type,
   Eraser,
-  MousePointer2
+  MousePointer2,
+  Image as ImageIcon
 } from "lucide-react";
 import { Game, TextRequest } from "@/draw/Game";
 import TextOverlay from "./TextOverlay";
@@ -47,6 +48,7 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   // messages shown over the board: server refusals, load failures, confirmations
   const [notices, setNotices] = useState<Notice[]>([]);
   const [confirmingClear, setConfirmingClear] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const showNotice = useCallback(
     (message: string, tone: "error" | "info" | "success" = "error") => {
@@ -81,6 +83,50 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
     game?.setOnNotice(showNotice);
   }, [game, showNotice]);
 
+  // Game asks for a tool change after adding an image, so the picture arrives
+  // ready to move rather than leaving the drawing tool armed over it
+  useEffect(() => {
+    game?.setOnToolChange(setSelectedTool);
+  }, [game]);
+
+  // Images arrive three ways - dropped, pasted, or picked from the toolbar -
+  // and all three end at Game.addImage. Paste is the one people actually use:
+  // it is how a screenshot gets onto a board.
+  useEffect(() => {
+    if (!game) return;
+
+    const centre = () => ({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+
+    const onDrop = (e: DragEvent) => {
+      const file = e.dataTransfer?.files?.[0];
+      if (!file) return;
+      e.preventDefault();
+      game.addImage(file, { x: e.clientX, y: e.clientY });
+    };
+    // without this the browser navigates away to display the dropped file,
+    // and the drop event never fires at all
+    const onDragOver = (e: DragEvent) => e.preventDefault();
+
+    const onPaste = (e: ClipboardEvent) => {
+      // let a paste into the text editor stay a paste into the text editor
+      const target = e.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA)$/.test(target.tagName)) return;
+      const file = Array.from(e.clipboardData?.files ?? [])[0];
+      if (!file) return;
+      e.preventDefault();
+      game.addImage(file, centre());
+    };
+
+    window.addEventListener("drop", onDrop);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("paste", onPaste);
+    return () => {
+      window.removeEventListener("drop", onDrop);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("paste", onPaste);
+    };
+  }, [game]);
+
   useEffect(() => {
     const update = () => setSize({ w: window.innerWidth, h: window.innerHeight });
     update();
@@ -103,6 +149,10 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
     if (!game || size.w === 0) return;
     game.repaint();
   }, [game, size.w, size.h]);
+
+  function handlePickImage(file: File) {
+    game?.addImage(file, { x: window.innerWidth / 2, y: window.innerHeight / 2 });
+  }
 
   function handleClear() {
     if (!game) return;
@@ -166,6 +216,22 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
         />
       )}
 
+      {/* accept + capture together: desktop gets a file picker, mobile offers
+          the camera as well, which is the "camera photos" route */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        capture="environment"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) handlePickImage(file);
+          // reset, or picking the same file twice in a row fires no change
+          e.target.value = "";
+        }}
+      />
+
       <ToastStack notices={notices} onDismiss={dismissNotice} />
 
       <TopBar
@@ -174,6 +240,7 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
         selectedColor={selectedColor}
         setSelectedColor={setSelectedColor}
         onClear={handleClear}
+        onPickImage={() => fileInputRef.current?.click()}
         themeChoice={choice}
         onCycleTheme={cycle}
       />
@@ -193,6 +260,7 @@ function TopBar({
   selectedColor,
   setSelectedColor,
   onClear,
+  onPickImage,
   themeChoice,
   onCycleTheme,
 }: {
@@ -201,6 +269,7 @@ function TopBar({
   selectedColor: ColorName;
   setSelectedColor: (c: ColorName) => void;
   onClear: () => void;
+  onPickImage: () => void;
   themeChoice: ThemeChoice;
   onCycleTheme: () => void;
 }) {
@@ -278,6 +347,13 @@ function TopBar({
           activated={selectedTool === "eraser"}
           icon={<Eraser size={20} />}
           title="Eraser"
+          {...iconProps}
+        />
+        <IconButton
+          onClick={onPickImage}
+          activated={false}
+          icon={<ImageIcon size={20} />}
+          title="Add an image - or just paste or drop one"
           {...iconProps}
         />
         <IconButton

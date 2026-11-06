@@ -1,0 +1,4 @@
+-- AlterTable
+ALTER TABLE "public"."User" ADD COLUMN     "isGuest" BOOLEAN NOT NULL DEFAULT false,
+ALTER COLUMN "email" DROP NOT NULL,
+ALTER COLUMN "password" DROP NOT NULL;

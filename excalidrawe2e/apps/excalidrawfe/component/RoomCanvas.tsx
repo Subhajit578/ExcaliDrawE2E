@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import axios from "axios";
 import { Canvas } from "./Canvas";
+import { getToken } from "@/lib/session";
 
 export function RoomCanvas({ slug }: { slug: string }) {
   const [roomId, setRoomId] = useState<number | null>(null);
@@ -10,9 +11,12 @@ export function RoomCanvas({ slug }: { slug: string }) {
 
   // Resolve slug → id
   useEffect(() => {
-    const token = localStorage.getItem("token");
+    // getToken, not localStorage: an expired token is treated as no token,
+    // so a session that ran out while the tab was closed says "sign in again"
+    // rather than failing as a 401 somewhere further in
+    const token = getToken();
     if (!token) {
-      setError("Not signed in");
+      setError("Your session has ended. Sign in again.");
       return;
     }
     axios
@@ -39,7 +43,11 @@ export function RoomCanvas({ slug }: { slug: string }) {
   // Open socket once we have the id
   useEffect(() => {
     if (roomId === null) return;
-    const token = localStorage.getItem("token");
+    const token = getToken();
+    if (!token) {
+      setError("Your session has ended. Sign in again.");
+      return;
+    }
     const ws = new WebSocket(`ws://localhost:8080?token=${token}`);
 
     ws.onopen = () => {

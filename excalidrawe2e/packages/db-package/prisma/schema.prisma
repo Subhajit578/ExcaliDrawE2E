@@ -1,4 +1,3 @@
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,22 +6,43 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
 model User {
-  id      String   @id    @default(uuid())
-  email       String     @unique
-  username    String      @unique
-  password    String
+  id String @id @default(uuid())
+
+  /// Nullable because a guest has none. Postgres allows many NULLs under a
+  /// unique index, so uniqueness still holds for everyone who does have one.
+  email    String? @unique
+  username String  @unique
+
+  /// Nullable for the same reason: a guest is held by its 15-day token and
+  /// nothing else. Sign-in must refuse an account with no password outright
+  /// rather than comparing against an empty hash.
+  password String?
+
+  /// A one-click account: generated name, no email, no password. Kept as a
+  /// column rather than inferred from `password == null` so that "is this a
+  /// guest" stays a fact about the account rather than a side effect of how
+  /// it happens to be secured.
+  isGuest Boolean @default(false)
+
+  /// When the account was made. Only consulted for guests, whose lifetime is
+  /// the lifetime of the token that is the only thing holding them.
+  createdAt DateTime @default(now())
+
   photo       String
   rooms       Room[]
-  shapes       Shape[]
+  shapes      Shape[]
   memberships RoomMember[]
+  files       File[]
 }
+
 model Room {
-  id       Int @id@default(autoincrement())
-  slug     String     @unique
-  adminId  String
-  admin    User      @relation(fields: [adminId], references: [id])
-  createdAt    DateTime @default(now())
+  id        Int          @id @default(autoincrement())
+  slug      String       @unique
+  adminId   String
+  admin     User         @relation(fields: [adminId], references: [id])
+  createdAt DateTime     @default(now())
   shapes    Shape[]
   members   RoomMember[]
 }
@@ -41,14 +61,57 @@ model RoomMember {
   @@unique([roomId, userId])
 }
 
+/// An uploaded image, addressed by the SHA-256 of its bytes.
+///
+/// Content addressing rather than a generated id, which buys three things:
+///
+///   - Deduplication is automatic. The same screenshot pasted into five boards
+///     is one row and one object in the bucket, with no comparison step.
+///   - The client can ask "do you already have this?" before uploading a byte,
+///     so a re-paste costs one round trip instead of a megabyte.
+///   - The URL is immutable, so it can be cached forever. A hash never points
+///     at different bytes, which is what makes `immutable` honest rather than
+///     a guess.
+///
+/// Rows are global, not per room: that is what makes dedup work across boards,
+/// and it is why deleting a file needs a reference count rather than a cascade.
+/// Nothing deletes files yet - unreferenced objects are swept separately.
+model File {
+  /// lowercase hex SHA-256 of the stored bytes; also the object key
+  hash      String   @id
+  mimeType  String
+  /// pixel dimensions, so a shape can be laid out before the bytes arrive
+  width     Int
+  height    Int
+  /// bytes, as reported by the object store rather than by the client
+  size      Int
+  createdAt DateTime @default(now())
+  /// Who first uploaded it; later uploaders of the same bytes are not
+  /// recorded. Nullable for the same reason as Shape.userId: the bytes may be
+  /// shown on a board the uploader does not own, and deleting the uploader
+  /// must not blank out someone else's picture.
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
 
 model Shape {
-  id        String @id
+  id        String   @id
   type      String
   data      Json
   roomId    Int
-  userId    String
   createdAt DateTime @default(now())
-  user      User     @relation(fields: [userId], references: [id])
-  room      Room     @relation(fields: [roomId], references: [id])
+
+  /// Who drew it, and nullable on purpose.
+  ///
+  /// A shape belongs to its room, not to its author: edit rights come from
+  /// being in the room, and nothing anywhere authorises by this column. So
+  /// when an expired guest is swept away, the marks they left on other
+  /// people's boards stay behind and stay editable - SetNull drops the
+  /// authorship rather than the work.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  room Room @relation(fields: [roomId], references: [id])
 }

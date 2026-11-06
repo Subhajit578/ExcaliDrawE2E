@@ -1,1 +1,1 @@
-{"root":["./src/index.ts","./src/middleware.ts"],"version":"5.9.2"}
+{"root":["./src/guestcleanup.ts","./src/guestnames.ts","./src/imagesize.ts","./src/index.ts","./src/middleware.ts","./src/storage.ts"],"version":"5.9.2"}

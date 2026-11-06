@@ -1,0 +1,32 @@
+# Local object storage.
+#
+# LocalStack emulates the S3 API, so the code that talks to it is the same code
+# that will talk to Cloudflare R2 or AWS S3 later - only the environment
+# changes. That is the point of running it rather than writing files to disk:
+# the local setup exercises the real upload path, presigned URLs and bucket
+# CORS included, so there is no "works locally, breaks in production" gap left
+# to discover at deploy time.
+#
+# This was MinIO until MinIO withdrew its community images from Docker Hub and
+# quay.io and stopped publishing binaries - the community edition is source
+# only now. LocalStack is a drop-in for this purpose because the application
+# only ever speaks S3.
+services:
+  s3:
+    image: localstack/localstack:4.0.3
+    container_name: whiteboard-s3
+    ports:
+      - "4566:4566" # the one S3 endpoint; the SDK and the browser both use it
+    environment:
+      # pinned: the latest tag now resolves to a licensed build that refuses
+      # to start without an auth token. 4.0.3 is the community image.
+      SERVICES: s3
+      DEBUG: "0"
+    volumes:
+      # scripts here run once the service is ready: bucket, policy, CORS
+      - ./infra/localstack-init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

@@ -1,10 +1,14 @@
 "use client"
 import React, { useState } from 'react';
-import { Eye, EyeOff, Mail, Lock, Sparkles } from 'lucide-react';
+import { Eye, EyeOff, Mail, Lock, Sparkles, UserRound } from 'lucide-react';
 import axios from 'axios'
 import {useRouter} from "next/navigation"
+import { setToken } from "@/lib/session"
 export function AuthPage({ isSignin }: { isSignin: boolean }) {
-    const [email, setEmail] = useState("");
+    // one field on sign-in: a username or an email, because guests only ever
+    // have the first and everyone who signed up before only had the second
+    const [identifier, setIdentifier] = useState("");
+    const [email, setEmail] = useState("");       // signup only
     const [username, setUsername] = useState(""); // shown only on signup
     const [password, setPassword] = useState("");
     const [showPassword, setShowPassword] = useState(false);
@@ -14,11 +18,31 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
     const router = useRouter()
     async function signIn() {
         const res = await axios.post("http://localhost:3001/signin",{
-            email,password
+            identifier, password
         })
-        const { token } =  res.data
-        localStorage.setItem("token",token);
+        setToken(res.data.token);
         router.push("/dashboard")
+    }
+
+    /**
+     * Start a guest session: one request, no form.
+     *
+     * The server names the account and returns a token; there is nothing to
+     * fill in and nothing to remember. The dashboard then offers to turn it
+     * into a real account, which is the only way it survives losing this
+     * browser.
+     */
+    async function continueAsGuest() {
+        setIsLoading(true);
+        setErrorMsg(null);
+        try {
+            const res = await axios.post("http://localhost:3001/guest");
+            setToken(res.data.token);
+            router.push("/dashboard");
+        } catch (err: any) {
+            setErrorMsg(err?.response?.data?.message ?? "Could not start a guest session");
+            setIsLoading(false);
+        }
     }
     async function signUp() {
         await axios.post("http://localhost:3001/signup",{
@@ -71,19 +95,24 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
               <form onSubmit={handleSubmit} className="space-y-6">
                 {/* Email */}
                 <div className="space-y-2">
-                  <label htmlFor="email" className="text-sm font-medium text-gray-700">
-                    Email address
+                  <label htmlFor="identifier" className="text-sm font-medium text-gray-700">
+                    {isSignin ? "Username or email" : "Email address"}
                   </label>
                   <div className="relative">
                     <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                      <Mail className="h-5 w-5 text-gray-400" />
+                      {isSignin
+                        ? <UserRound className="h-5 w-5 text-gray-400" />
+                        : <Mail className="h-5 w-5 text-gray-400" />}
                     </div>
                     <input
-                      id="email"
-                      type="email"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      placeholder="Enter your email"
+                      id="identifier"
+                      // not type="email" on sign-in: the browser would reject a
+                      // username as malformed before the request is even sent
+                      type={isSignin ? "text" : "email"}
+                      value={isSignin ? identifier : email}
+                      onChange={(e) => isSignin ? setIdentifier(e.target.value) : setEmail(e.target.value)}
+                      placeholder={isSignin ? "Your username or email" : "Enter your email"}
+                      autoComplete={isSignin ? "username" : "email"}
                       className="w-full pl-12 pr-4 py-3 border placeholder:text-gray-500  border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors duration-200 bg-gray-50/50 backdrop-blur-none"
                       required
                     />
@@ -159,7 +188,22 @@ export function AuthPage({ isSignin }: { isSignin: boolean }) {
                   </span>
                 </button>
               </form>
-    
+
+              {/* Guest: the way in for anyone who does not want an account yet.
+                  Offered on both pages - needing one is as likely to stop you
+                  signing in as signing up. */}
+              <div className="mt-4">
+                <button
+                  type="button"
+                  onClick={continueAsGuest}
+                  disabled={isLoading}
+                  className="w-full border border-gray-200 text-gray-700 py-3 px-4 rounded-xl font-medium hover:bg-gray-50 focus:ring-4 focus:ring-indigo-100 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  <UserRound className="h-5 w-5 text-gray-400" />
+                  Continue as guest
+                </button>
+              </div>
+
               {/* Messages */}
               {errorMsg && (
                 <p className="mt-4 text-sm text-red-600" role="alert">

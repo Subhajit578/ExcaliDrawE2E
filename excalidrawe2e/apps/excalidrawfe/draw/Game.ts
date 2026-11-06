@@ -1,5 +1,6 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
+import { imageUrl, uploadImage, isSupportedImage } from "./images";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 import { SELECT_TOLERANCE, ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
 import { circleFromDrag, elbowPoints } from "./routing";
@@ -11,6 +12,8 @@ import {
   handlesOf,
   hitTest,
   hitTestInside,
+  isDegenerate,
+  roundShape,
   OPPOSITE,
   scale,
   scaleFactors,
@@ -19,6 +22,18 @@ import {
   type Bounds,
   type Corner,
 } from "./hitTest";
+
+/** The cursor that shows which way a grip will stretch the selection. */
+const RESIZE_CURSOR: Record<Corner, string> = {
+  nw: "nwse-resize",
+  se: "nwse-resize",
+  ne: "nesw-resize",
+  sw: "nesw-resize",
+  n: "ns-resize",
+  s: "ns-resize",
+  e: "ew-resize",
+  w: "ew-resize",
+};
 
 /** how long a newly drawn shape keeps its fading pad, in ms */
 const APPEAR_MS = 450;
@@ -49,7 +64,16 @@ export type Shape =
   // x,y is the top-left of the first line, matching the editor overlay's box.
   // Size and family are stored per shape: they cannot be recovered from the
   // string later, and export and hit-testing will both need them.
-  | { type: "text"; x: number; y: number; text: string; fontSize: number; fontFamily: string; color: string; id: string };
+  | { type: "text"; x: number; y: number; text: string; fontSize: number; fontFamily: string; color: string; id: string }
+  // An uploaded picture. `hash` is the SHA-256 of its bytes, which is both the
+  // storage key and the cache key - the pixels are never carried on the wire
+  // or in the database, only this name for them. That is why an image shape
+  // syncs through the same message as every other shape, with no protocol
+  // work: collaborators resolve the hash to bytes themselves.
+  //
+  // `color` is unused but kept so the union stays uniform for callers that
+  // read it generically.
+  | { type: "image"; x: number; y: number; width: number; height: number; hash: string; color: string; id: string };
 
 /**
  * A stroke someone else is drawing right now. Held only until their finished
@@ -203,10 +227,32 @@ export class Game {
    * server echoes the update, which doubles as the acknowledgement.
    */
   private pendingUpdates: Map<string, Shape> = new Map();
+  /**
+   * hash -> decoded bitmap, or how far the attempt to get one has got.
+   *
+   * The canvas is immediate mode: clearCanvas must draw synchronously, so a
+   * bitmap either is in memory when the frame runs or it is not. Fetching is
+   * kicked off on the first frame that needs it, a placeholder is drawn, and
+   * the arrival triggers a repaint.
+   *
+   * "failed" is recorded rather than retried, because a repaint loop that
+   * re-requests a missing object would hammer storage for as long as the shape
+   * is on screen.
+   */
+  private images: Map<string, ImageBitmap | "loading" | "failed"> = new Map();
+
   /* ── networking ─────────────────────────────────────────────────────── */
   socket: WebSocket;
   /** set by React; asks it to open a text editor at a point. See setOnTextRequest. */
   private onTextRequest: ((req: TextRequest) => void) | null = null;
+
+  /**
+   * set by React; asks it to switch the active tool. See setOnToolChange.
+   *
+   * The toolbar owns which tool is active, so Game cannot just change it - it
+   * can only ask, the same way it asks for a text editor.
+   */
+  private onToolChange: ((tool: Tool) => void) | null = null;
 
   /** set by React; shows a message to the person. See setOnNotice. */
   private onNotice: ((message: string, tone: "error" | "info" | "success") => void) | null = null;
@@ -254,16 +300,32 @@ export class Game {
 
   setTool(tool: Tool) {
     const wasEraser = this.selectedTool === "eraser";
+    const leavingSelect = tool !== "select" && this.selectedIds.size > 0;
     this.selectedTool = tool;
-    // the grab cursor belongs to select alone; without this it would stick
-    // after switching to a drawing tool
-    this.canvas.style.cursor = tool === "select" ? "default" : "crosshair";
 
-    // hide the system pointer behind the eraser's own ring, and clear the ring
-    // when switching away so it does not linger over the board
-    this.canvas.style.cursor = tool === "eraser" ? "none" : "default";
+    // A selection belongs to the select tool. Left standing while a drawing
+    // tool is active, its outline and grips look like the shape is still
+    // live - and the grips are worse than cosmetic, because they are only
+    // consulted under the select tool, so they advertise a resize that a
+    // click will not perform.
+    if (leavingSelect) {
+      this.selectedIds.clear();
+      this.dragOriginals.clear();
+      this.resizing = null;
+      this.marquee = null;
+    }
+
+    // One assignment, not three: eraser hides the system pointer behind its
+    // own ring, select uses the arrow so hovering can swap in grab and resize
+    // cursors, and everything else draws, so it gets a crosshair.
+    this.canvas.style.cursor =
+      tool === "eraser" ? "none" : tool === "select" ? "default" : "crosshair";
+
+    // clear the eraser ring when switching away, so it does not linger
     if (wasEraser && tool !== "eraser") {
       this.cursor = null;
+    }
+    if (leavingSelect || (wasEraser && tool !== "eraser")) {
       this.clearCanvas();
     }
   }
@@ -291,6 +353,17 @@ export class Game {
     this.onNotice = cb;
   }
 
+  /**
+   * Let React be told when the board needs a different tool.
+   *
+   * Only used after adding an image so far: the thing you want to do with a
+   * picture you just dropped is move or resize it, and being left holding the
+   * circle tool means a stray click draws on top of it instead.
+   */
+  setOnToolChange(cb: (tool: Tool) => void) {
+    this.onToolChange = cb;
+  }
+
   /** report something to the person, and keep it in the console for debugging */
   private notify(message: string, tone: "error" | "info" | "success" = "error") {
     if (tone === "error") console.error("[canvas]", message);
@@ -313,6 +386,82 @@ export class Game {
   /* ══════════════════════════════════════════════════════════════════════
    * Painting
    * ══════════════════════════════════════════════════════════════════════ */
+
+  /**
+   * Fetch and decode the bytes for a hash, once.
+   *
+   * Marked "loading" before the request so a second frame does not start a
+   * second fetch - at 60fps a drag over an unloaded image would otherwise
+   * launch dozens.
+   */
+  private async loadImage(hash: string) {
+    this.images.set(hash, "loading");
+    try {
+      const response = await fetch(imageUrl(hash));
+      if (!response.ok) throw new Error(`storage returned ${response.status}`);
+      const bitmap = await createImageBitmap(await response.blob());
+      this.images.set(hash, bitmap);
+      this.clearCanvas();
+    } catch (err) {
+      console.error("[canvas] could not load image", hash, err);
+      this.images.set(hash, "failed");
+      this.clearCanvas();
+    }
+  }
+
+  /**
+   * Put a file on the board.
+   *
+   * Upload first, shape second: a shape pointing at bytes that failed to store
+   * would draw a broken box for everyone, and it would be in the database.
+   * Nothing is created until the hash is real.
+   */
+  async addImage(file: File, at: Point) {
+    if (!isSupportedImage(file)) {
+      this.notify("That file type is not supported");
+      return;
+    }
+    try {
+      const { hash, width, height } = await uploadImage(file);
+
+      // fit to a comfortable size on screen rather than the image's own, which
+      // for a screenshot is usually larger than the viewport
+      const maxOnScreen = Math.min(this.canvas.width, this.canvas.height) * 0.6;
+      const factor = Math.min(1, maxOnScreen / Math.max(width, height));
+      const w = Math.round(width * factor);
+      const h = Math.round(height * factor);
+
+      const id = newId();
+      this.commitShape({
+        id,
+        type: "image",
+        // centre it on the drop point: dropping somewhere should put the image
+        // under the cursor, not start it there
+        x: at.x - w / 2,
+        y: at.y - h / 2,
+        width: w,
+        height: h,
+        hash,
+        color: this.currentColor,
+      });
+
+      // Hand it over ready to be moved or resized. Nobody drops a picture in
+      // order to keep drawing circles, and leaving the drawing tool active
+      // means the first click lands a shape on top of it.
+      //
+      // Set here as well as asked of React: the state change arrives a render
+      // later, and a mousedown in that gap would still be read as drawing.
+      this.selectedTool = "select";
+      this.selectedIds.clear();
+      this.selectedIds.add(id);
+      this.canvas.style.cursor = "default";
+      this.onToolChange?.("select");
+      this.clearCanvas();
+    } catch (err) {
+      console.error("[canvas] image upload failed:", err);
+      this.notify("Could not upload that image");
+    }
+  }
 
   /**
    * Repaint from the shape list. The entry point for anything outside the
@@ -364,6 +513,24 @@ export class Game {
       }
       else if (shape.type === "text") {
         this.renderer.text(shape.x, shape.y, shape.text, color, shape.fontSize, shape.fontFamily);
+      }
+      else if (shape.type === "image") {
+        const cached = this.images.get(shape.hash);
+        if (cached instanceof ImageBitmap) {
+          this.renderer.image(cached, shape.x, shape.y, shape.width, shape.height);
+        } else {
+          // not here yet, or never coming: hold the space either way, so the
+          // board does not reflow when the picture lands
+          this.renderer.imagePlaceholder(
+            shape.x,
+            shape.y,
+            shape.width,
+            shape.height,
+            THEMES[this.theme].panelMuted,
+            cached === "failed"
+          );
+          if (cached === undefined) this.loadImage(shape.hash);
+        }
       }
     });
     
@@ -604,7 +771,11 @@ export class Game {
    * Shared by the mouse handlers and by text, which commits on a blur rather
    * than a mouseup.
    */
-  private commitShape(shape: Shape) {
+  private commitShape(unrounded: Shape) {
+    // the other place geometry leaves this client, so rounded for the same
+    // reason as updateShape: a circle dragged out lands on x.5 as often as
+    // not, and that fraction would be stored and broadcast forever
+    const shape = roundShape(unrounded);
     this.existingShapes.push(shape);
     this.shapeIds.add(shape.id);
     this.markAppearing(shape.id);
@@ -665,7 +836,11 @@ export class Game {
   }
 
   /** Replace a shape everywhere: locally, for everyone else, and in the database. */
-   updateShape(shape: Shape) {
+   updateShape(unrounded: Shape) {
+    // the one place geometry leaves this client, so the one place worth
+    // tidying: a drag's intermediate frames stay fractional and smooth, and
+    // only the committed result is rounded
+    const shape = roundShape(unrounded);
     const previous = this.existingShapes.find((s) => s.id === shape.id);
     if (!this.applyShape(shape)) {
       return;
@@ -975,17 +1150,41 @@ export class Game {
    * setOnTextRequest, and owns the editor itself.
    */
   dblClickHandler = (e: MouseEvent) => {
-    if (this.selectedTool !== "text") return;
     const at = this.pointOf(e);
-    const texts = this.existingShapes.filter((s) => s.type === "text");
-    const hit = hitTest(texts, at, 4);
-    if (hit && hit.type === "text") {
-    this.editingId = hit.id;
-    this.clearCanvas();                               // hide it while the editor is open
-    this.onTextRequest?.({ at: { x: hit.x, y: hit.y }, shape: hit });
-    } else {
-  this.onTextRequest?.({ at });
-}
+
+    if (this.selectedTool === "text") {
+      const texts = this.existingShapes.filter((s) => s.type === "text");
+      const hit = hitTest(texts, at, 4);
+      if (hit && hit.type === "text") {
+        this.editingId = hit.id;
+        this.clearCanvas();                           // hide it while the editor is open
+        this.onTextRequest?.({ at: { x: hit.x, y: hit.y }, shape: hit });
+      } else {
+        this.onTextRequest?.({ at });
+      }
+      return;
+    }
+
+    // With any other tool, a double click on a shape picks it up: reaching for
+    // something you can already see should not require finding the right tool
+    // first. The same two tests the select tool uses, so a double click grabs
+    // exactly what a click with that tool would have.
+    //
+    // The eraser is excluded - its first click has already deleted whatever
+    // was there, and selecting the next thing underneath would be a surprise.
+    if (this.selectedTool === "eraser") return;
+
+    const hit =
+      hitTest(this.existingShapes, at, SELECT_TOLERANCE) ??
+      hitTestInside(this.existingShapes, at);
+    if (!hit) return;
+
+    this.selectedTool = "select";
+    this.selectedIds.clear();
+    this.selectedIds.add(hit.id);
+    this.canvas.style.cursor = "default";
+    this.onToolChange?.("select");
+    this.clearCanvas();
   };
 
   /**
@@ -1125,6 +1324,16 @@ export class Game {
       return;
     }
 
+    // A click rather than a drag: the shape has no size. Committing it would
+    // put an invisible row in the database that still sits in the z-order,
+    // above everything drawn before it, swallowing clicks at that point.
+    // Dropping it silently is right - the person did not mean to draw.
+    if (isDegenerate(shape)) {
+      this.currentStroke = [];
+      this.currentStrokeId = null;
+      return;
+    }
+
     this.commitShape(shape);
 
     // reset pencil state after commit
@@ -1155,21 +1364,27 @@ export class Game {
     // picked up - there are no handles on it yet
     if (this.selectedTool === "select") {
       if (this.resizing) {
-        // read from where the cursor is now, not from the corner that was
-        // grabbed: dragging through the anchor turns an se grip into a sw one,
-        // and the arrow has to turn with it
-        const dx = e.clientX - this.resizing.anchor.x;
-        const dy = e.clientY - this.resizing.anchor.y;
-        this.canvas.style.cursor =
-          dx >= 0 === dy >= 0 ? "nwse-resize" : "nesw-resize";
+        const corner = this.resizing.corner;
+        if (corner === "n" || corner === "s") {
+          this.canvas.style.cursor = "ns-resize";
+        } else if (corner === "e" || corner === "w") {
+          this.canvas.style.cursor = "ew-resize";
+        } else {
+          // read from where the cursor is now, not from the corner that was
+          // grabbed: dragging through the anchor turns an se grip into a sw
+          // one, and the arrow has to turn with it
+          const dx = e.clientX - this.resizing.anchor.x;
+          const dy = e.clientY - this.resizing.anchor.y;
+          this.canvas.style.cursor =
+            dx >= 0 === dy >= 0 ? "nwse-resize" : "nesw-resize";
+        }
       } else if (this.dragOriginals.size > 0) {
         this.canvas.style.cursor = "grabbing";
       } else if (this.hoveredHandle(this.pointOf(e))) {
-        // the diagonal the grip moves along: nw and se share one, ne and sw
-        // the other
         const corner = this.hoveredHandle(this.pointOf(e))!;
-        this.canvas.style.cursor =
-          corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize";
+        // the line the grip travels along: a diagonal for a corner, a single
+        // axis for an edge
+        this.canvas.style.cursor = RESIZE_CURSOR[corner];
       } else {
         const over =
           hitTest(this.existingShapes, this.pointOf(e), SELECT_TOLERANCE) ??

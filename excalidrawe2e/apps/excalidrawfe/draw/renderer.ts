@@ -103,6 +103,60 @@ export class ShapeRenderer {
     this.ctx.restore();
   }
 
+  /**
+   * An uploaded picture, already decoded.
+   *
+   * Takes a bitmap rather than a URL because the canvas is immediate mode:
+   * every repaint must draw synchronously, and there is nowhere to await a
+   * network fetch. Decoding and caching happen outside; this only paints.
+   */
+  image(bitmap: CanvasImageSource, x: number, y: number, width: number, height: number) {
+    // negative sizes come from a flipped resize; drawImage would silently draw
+    // nothing rather than mirror, so normalise to a top-left origin
+    const left = width < 0 ? x + width : x;
+    const top = height < 0 ? y + height : y;
+    this.ctx.drawImage(bitmap, left, top, Math.abs(width), Math.abs(height));
+  }
+
+  /**
+   * Stand-in for an image whose bytes have not arrived, or will not.
+   *
+   * Drawn at the shape's real size so the board does not reflow when the
+   * picture appears - the gap is already the right shape.
+   */
+  imagePlaceholder(
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    color: string,
+    failed: boolean
+  ) {
+    const left = width < 0 ? x + width : x;
+    const top = height < 0 ? y + height : y;
+    const w = Math.abs(width);
+    const h = Math.abs(height);
+
+    this.ctx.save();
+    this.ctx.strokeStyle = color;
+    this.ctx.fillStyle = color;
+    this.ctx.lineWidth = 1;
+    this.ctx.globalAlpha = 0.35;
+    this.ctx.setLineDash(failed ? [2, 3] : [6, 4]);
+    this.ctx.strokeRect(left, top, w, h);
+
+    if (failed) {
+      // a cross, so a broken image is distinguishable from one still loading
+      this.ctx.beginPath();
+      this.ctx.moveTo(left, top);
+      this.ctx.lineTo(left + w, top + h);
+      this.ctx.moveTo(left + w, top);
+      this.ctx.lineTo(left, top + h);
+      this.ctx.stroke();
+    }
+    this.ctx.restore();
+  }
+
   /** wipe the canvas and lay down the board colour */
   clear(background: string) {
     const { width, height } = this.ctx.canvas;

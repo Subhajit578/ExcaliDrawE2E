@@ -3,6 +3,8 @@ import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import axios from "axios";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { getToken, clearToken } from "@/lib/session";
+import { ClaimAccountBanner } from "./ClaimAccountBanner";
 import {
   Sparkles,
   Plus,
@@ -59,13 +61,25 @@ export function Dashboard() {
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [openMenuId, setOpenMenuId] = useState<number | null>(null);
 
+  // who is signed in, so a guest can be offered the upgrade. Asked of the
+  // server rather than read from the token: a token minted before the account
+  // was claimed would keep claiming it is a guest.
+  const [me, setMe] = useState<{ username: string; email: string | null; isGuest: boolean } | null>(null);
+  const [claiming, setClaiming] = useState(false);
+
   useEffect(() => {
-    const token = localStorage.getItem("token");
+    // getToken drops an expired one, so this also covers a session that ran
+    // out while the tab was closed
+    const token = getToken();
     if (!token) {
       router.push("/signin");
       return;
     }
     fetchRooms();
+    axios
+      .get(`${API}/me`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => setMe(r.data))
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -77,7 +91,7 @@ export function Dashboard() {
   }, [openMenuId]);
 
   function authHeaders() {
-    return { Authorization: `Bearer ${localStorage.getItem("token")}` };
+    return { Authorization: `Bearer ${getToken()}` };
   }
 // 
   /**
@@ -201,7 +215,7 @@ export function Dashboard() {
   }
 
   function handleLogout() {
-    localStorage.removeItem("token");
+    clearToken();
     router.push("/signin");
   }
 
@@ -227,6 +241,12 @@ export function Dashboard() {
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-10">
+        {me?.isGuest && (
+          <ClaimAccountBanner
+            username={me.username}
+            onClaimed={() => setMe({ ...me, isGuest: false })}
+          />
+        )}
         {/* Heading row */}
         <div className="flex items-center justify-between mb-8">
           <div>

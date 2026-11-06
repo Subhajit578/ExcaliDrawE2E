@@ -2,13 +2,37 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import {isLoggedIn} from "./middleware"
 import {JWT_SECRET} from '@repo/backend-common/config'
-import {CreateUserSchema,SigninUserSchema,CreateRoomSchema} from "@repo/common/types";
+import {CreateUserSchema,SigninUserSchema,CreateRoomSchema,ClaimAccountSchema,PresignUploadSchema,ConfirmUploadSchema,MAX_IMAGE_BYTES} from "@repo/common/types";
+import { guestUsername, MAX_NAME_ATTEMPTS } from "./guestNames";
+import { startGuestSweeper, GUEST_TTL_DAYS } from "./guestCleanup";
+import { presignPut, headObject, publicUrl, getObjectPrefix } from "./storage";
+import { readDimensions, HEADER_BYTES } from "./imageSize";
 import { prismaClient} from "@repo/db-package/client"
 import cors from "cors"
 import bcrypt from "bcrypt"
 const app = express()
 app.use(express.json())
 app.use(cors())
+
+/**
+ * How long a session lasts.
+ *
+ * Long enough that someone returning to a board next week is simply still
+ * signed in, which matters most for guests: the token is the only thing
+ * holding a one-click account, so an expiry is also the account's lifetime.
+ *
+ * Absolute rather than sliding - 15 days from issue, not from last use. A
+ * sliding window needs a refresh endpoint and a way to revoke, which is a
+ * bigger change than this is worth today.
+ */
+const TOKEN_TTL = `${GUEST_TTL_DAYS}d`;
+
+/** The only place a session token is minted, so the lifetime cannot drift. */
+function issueToken(user: { id: string; username: string }) {
+  return jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, {
+    expiresIn: TOKEN_TTL,
+  });
+}
 
 //done 
 app.post("/signup", async (req,res) => {
@@ -39,28 +63,149 @@ app.post("/signup", async (req,res) => {
 }) 
 // done 
 app.post("/signin", async (req,res) => {
-    const email = req.body.email
-    const password = req.body.password
     const safeData = SigninUserSchema.safeParse(req.body)
-    if(safeData.success ){
-        const user = await prismaClient.user.findFirst({
-            where : {email},
-            select: { username: true, id: true, password: true }
+    if (!safeData.success) {
+        return res.status(422).send({ message: "Invalid input format" })
+    }
+    const { password } = safeData.data
+    // one field for both: guests have no email, and everyone who signed up
+    // before this change typed one. Looking in both columns means the switch
+    // to username-first logins locks nobody out.
+    const identifier = (safeData.data.identifier ?? safeData.data.email)!.trim()
+
+    const user = await prismaClient.user.findFirst({
+        where: { OR: [{ username: identifier }, { email: identifier }] },
+        select: { username: true, id: true, password: true, isGuest: true },
     })
-    if(!user){
-        return res.status(404).send({"message":"User not found"})
-    } else {
-        const passwordMatch = await bcrypt.compare(password,user.password)
-        if(passwordMatch){
-            //@ts-ignore
-            const token = jwt.sign({userId:user.id,username : user.username},JWT_SECRET) 
-            return res.status(200).send({token :token})
-        } else {
-            return res.status(401).send({message:  "Invalid credentials"})
+
+    // Same answer for "no such user" and "wrong password": telling them apart
+    // turns this endpoint into a way to discover which usernames exist.
+    const DENIED = { message: "Invalid credentials" }
+    if (!user) {
+        return res.status(401).send(DENIED)
+    }
+    if (!user.password) {
+        // a guest, held by its token alone - there is no password to check,
+        // and bcrypt.compare against an empty hash would throw
+        return res.status(401).send({
+            message: "That is a guest account. Open it again from the browser you created it in.",
+        })
+    }
+
+    const passwordMatch = await bcrypt.compare(password, user.password)
+    if (!passwordMatch) {
+        return res.status(401).send(DENIED)
+    }
+    return res.status(200).send({ token: issueToken(user) })
+})
+
+/**
+ * Start a one-click guest session.
+ *
+ * No form, no email, no password: the account is held entirely by the token
+ * this returns, which is also why its expiry is the account's lifetime. The
+ * claim route below is how it stops being disposable.
+ */
+app.post("/guest", async (req, res) => {
+    // The database decides uniqueness, not a pre-flight check: a check
+    // followed by an insert is a race, and the unique constraint is the only
+    // thing that can actually settle it. So: try, and retry on collision.
+    for (let attempt = 0; attempt < MAX_NAME_ATTEMPTS; attempt++) {
+        try {
+            const user = await prismaClient.user.create({
+                data: {
+                    username: guestUsername(attempt),
+                    email: null,
+                    password: null,
+                    isGuest: true,
+                    photo: "",
+                },
+                select: { id: true, username: true },
+            })
+            return res.status(200).send({
+                token: issueToken(user),
+                username: user.username,
+                isGuest: true,
+            })
+        } catch (err: any) {
+            if (err?.code === "P2002") continue   // name taken; the suffix widens
+            console.error("[auth] guest creation failed:", err)
+            return res.status(500).send({ message: "Could not start a guest session" })
         }
     }
-    } else {
-       return  res.status(422).send({message:"Invalid input format "})
+    console.error("[auth] exhausted guest name attempts")
+    return res.status(503).send({ message: "Could not start a guest session, try again" })
+})
+
+/**
+ * Who the caller is.
+ *
+ * The token carries a username, but not whether the account is a guest - and
+ * baking that into the token would mean it going stale the moment the account
+ * is claimed. Asked rather than stored, so it is always current.
+ */
+app.get("/me", isLoggedIn, async (req, res) => {
+    //@ts-ignore - set by isLoggedIn
+    const userId: string = req.userId
+    const user = await prismaClient.user.findUnique({
+        where: { id: userId },
+        select: { id: true, username: true, email: true, isGuest: true },
+    })
+    if (!user) {
+        return res.status(404).send({ message: "User not found" })
+    }
+    return res.send(user)
+})
+
+/**
+ * Turn the signed-in guest into a real account.
+ *
+ * Keeps the same user row, so every board, membership and shape it owns stays
+ * put - that is the whole point of having an account before you have
+ * credentials. Only the credentials are added.
+ */
+app.post("/account/claim", isLoggedIn, async (req, res) => {
+    const parsed = ClaimAccountSchema.safeParse(req.body)
+    if (!parsed.success) {
+        return res.status(422).send({
+            message: parsed.error.issues[0]?.message ?? "Invalid details",
+        })
+    }
+    //@ts-ignore - set by isLoggedIn
+    const userId: string = req.userId
+
+    const current = await prismaClient.user.findUnique({
+        where: { id: userId },
+        select: { isGuest: true },
+    })
+    if (!current) {
+        return res.status(404).send({ message: "User not found" })
+    }
+    if (!current.isGuest) {
+        // not an error the UI should ever cause, but claiming twice would
+        // otherwise overwrite a real account's password from a stale tab
+        return res.status(409).send({ message: "This account is already registered" })
+    }
+
+    try {
+        const user = await prismaClient.user.update({
+            where: { id: userId },
+            data: {
+                email: parsed.data.email,
+                password: await bcrypt.hash(parsed.data.password, 10),
+                isGuest: false,
+            },
+            select: { id: true, username: true },
+        })
+        // a fresh token: the old one says nothing untrue, but reissuing keeps
+        // the 15 days measured from becoming a real account
+        return res.status(200).send({ token: issueToken(user), username: user.username })
+    } catch (err: any) {
+        if (err?.code === "P2002") {
+            return res.status(409).send({ message: "That email is already registered" })
+        }
+        console.error("[auth] claim failed:", err)
+        return res.status(500).send({ message: "Could not save those details" })
     }
 })
 app.post("/room", isLoggedIn ,async (req,res) => {
@@ -241,7 +386,152 @@ app.patch("/room/:id", isLoggedIn, async (req, res) => {
       res.status(500).send({ message: "Failed to rename" });
     }
   });
-app.listen(3001)
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Image uploads
+ *
+ * Two small JSON calls around an upload this process never sees. The browser
+ * sends the bytes straight to object storage with a presigned URL, so the API
+ * never buffers a file, never pays for the bandwidth twice, and does not get
+ * slower as images get bigger. Scaling the board and scaling image traffic
+ * become separate problems.
+ *
+ * Images are addressed by the SHA-256 of their bytes, so the same picture is
+ * stored once however many boards it lands on, and its URL can be cached
+ * forever because a hash cannot come to mean different bytes.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Ask for permission to upload one image.
+ *
+ * Answers one of two things: "already have it" - costing a re-paste a single
+ * round trip instead of a megabyte - or a URL good for one PUT of these exact
+ * bytes, for a few minutes.
+ *
+ * This is the only endpoint that hands out write access to the bucket, so the
+ * body is validated strictly before anything is signed: the hash shape,
+ * because it becomes the object key; the type, against an allowlist; and the
+ * size, because the client's own limit is a courtesy rather than a control.
+ */
+app.post("/files/presign", isLoggedIn, async (req, res) => {
+  const parsed = PresignUploadSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(422).send({
+      message: "Invalid upload request",
+      issues: parsed.error.issues.map((i) => i.message),
+    });
+  }
+  const { hash, mimeType, size } = parsed.data;
+
+  try {
+    const existing = await prismaClient.file.findUnique({ where: { hash } });
+    if (existing) {
+      // someone has already uploaded these exact bytes, here or on another
+      // board: nothing to send, and nothing to write
+      return res.send({
+        exists: true,
+        url: publicUrl(hash),
+        width: existing.width,
+        height: existing.height,
+      });
+    }
+
+    const uploadUrl = await presignPut(hash, mimeType);
+    return res.send({ exists: false, uploadUrl, maxBytes: MAX_IMAGE_BYTES, size });
+  } catch (err) {
+    console.error("[files] presign failed:", err);
+    return res.status(500).send({ message: "Could not start the upload" });
+  }
+});
+
+/**
+ * Report that the upload finished, and get the row written.
+ *
+ * The claim is checked rather than believed: the object store is asked whether
+ * the key exists and how big it is, and those answers - not the client's - are
+ * what get stored. Without that, anyone could register rows for objects that
+ * were never uploaded.
+ *
+ * Writing is idempotent. A retry after a dropped response finds the row
+ * already there and succeeds, because the hash is the primary key and the
+ * bytes behind it cannot have changed.
+ */
+app.post("/files/confirm", isLoggedIn, async (req, res) => {
+  const parsed = ConfirmUploadSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(422).send({ message: "Invalid confirmation" });
+  }
+  const { hash, width, height } = parsed.data;
+  //@ts-ignore - set by isLoggedIn
+  const userId: string = req.userId;
+
+  try {
+    const existing = await prismaClient.file.findUnique({ where: { hash } });
+    if (existing) {
+      return res.send({ url: publicUrl(hash), width: existing.width, height: existing.height });
+    }
+
+    const stored = await headObject(hash);
+    if (!stored) {
+      return res.status(409).send({ message: "That upload did not arrive" });
+    }
+    if (stored.size > MAX_IMAGE_BYTES) {
+      return res.status(413).send({ message: "That image is too large" });
+    }
+
+    // Read the dimensions out of the stored header rather than believing the
+    // ones in the body. HeadObject cannot report them - it decodes nothing -
+    // so this is a ranged GET of the first few kilobytes.
+    //
+    // It matters more than it looks: a File row is written once and then
+    // returned to every later upload of the same bytes, so a wrong value is
+    // permanent and has no path to correction. The cost of a bad one is only
+    // layout - the shape gets the wrong aspect and the bitmap is stretched into
+    // it - but it is the last field in the pipeline that was taken on trust.
+    //
+    // A parse failure falls back to the client's numbers: an unrecognised
+    // header is a reason to distrust the dimensions, not to reject an upload
+    // whose bytes are already stored and verified by their hash.
+    const prefix = await getObjectPrefix(hash, HEADER_BYTES);
+    const measured = prefix ? readDimensions(prefix) : null;
+    if (!measured) {
+      console.warn(
+        `[files] could not read dimensions for ${hash} (${stored.mimeType}); using the client's`
+      );
+    }
+    const actualWidth = measured?.width ?? width;
+    const actualHeight = measured?.height ?? height;
+
+    await prismaClient.file.create({
+      data: {
+        hash,
+        mimeType: stored.mimeType,
+        size: stored.size,
+        width: actualWidth,
+        height: actualHeight,
+        userId,
+      },
+    });
+
+    return res.send({ url: publicUrl(hash), width: actualWidth, height: actualHeight });
+  } catch (err: any) {
+    // two tabs confirming the same paste at once: the loser of the race finds
+    // the row already written, which is the outcome it wanted anyway
+    if (err?.code === "P2002") {
+      return res.send({ url: publicUrl(hash), width, height });
+    }
+    console.error("[files] confirm failed:", err);
+    return res.status(500).send({ message: "Could not save that image" });
+  }
+});
+
+// configurable so a second instance can be run alongside the dev one, for
+// example to exercise a route against the real database without restarting it
+// expired guests are unreachable accounts: swept so the table does not grow
+// without bound, and so their usernames come back into circulation
+startGuestSweeper();
+
+app.listen(Number(process.env.PORT) || 3001)
 
 
 
