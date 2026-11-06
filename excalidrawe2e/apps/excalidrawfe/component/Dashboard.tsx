@@ -3,8 +3,9 @@ import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import axios from "axios";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { getToken, clearToken } from "@/lib/session";
+import { getToken, clearToken, installSessionGuard } from "@/lib/session";
 import { ClaimAccountBanner } from "./ClaimAccountBanner";
+import { DeleteAccountDialog } from "./DeleteAccountDialog";
 import {
   Sparkles,
   Plus,
@@ -66,8 +67,12 @@ export function Dashboard() {
   // was claimed would keep claiming it is a guest.
   const [me, setMe] = useState<{ username: string; email: string | null; isGuest: boolean } | null>(null);
   const [claiming, setClaiming] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
 
   useEffect(() => {
+    // before the first authenticated call: a token whose account has been
+    // deleted still looks valid here, and only the server can say otherwise
+    installSessionGuard();
     // getToken drops an expired one, so this also covers a session that ran
     // out while the tab was closed
     const token = getToken();
@@ -477,7 +482,42 @@ export function Dashboard() {
             </div>
           </section>
         )}
+
+        {/* Set apart at the foot of the page, deliberately plain and far from
+            Sign out - the two are one slip apart otherwise, and only one of
+            them is reversible. */}
+        <section className="mt-16 border-t border-gray-200 pt-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-gray-700">Delete account</p>
+              <p className="text-sm text-gray-500">
+                Removes your account and your canvases. Work you did on other people&rsquo;s
+                canvases stays.
+              </p>
+            </div>
+            <button
+              onClick={() => setDeletingAccount(true)}
+              className="rounded-lg border border-red-200 px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50"
+            >
+              Delete account
+            </button>
+          </div>
+        </section>
       </main>
+
+      {deletingAccount && (
+        <DeleteAccountDialog
+          isGuest={me?.isGuest ?? false}
+          roomCount={rooms.length}
+          onCancel={() => setDeletingAccount(false)}
+          onDeleted={() => {
+            // the token now names an account that does not exist, so it has to
+            // go with it - otherwise every later request 401s with no reason
+            clearToken();
+            router.push("/signin");
+          }}
+        />
+      )}
 
       {deleteTarget && (
         <ConfirmDialog

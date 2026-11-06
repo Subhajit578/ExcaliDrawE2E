@@ -45,6 +45,55 @@ const BATCH = 200;
 export type SweepResult = { accounts: number; rooms: number };
 
 /**
+ * Erase one account and everything that only existed because of it.
+ *
+ * Shared by the expiry sweep and by someone deleting their own account, which
+ * want exactly the same thing to happen - the difference is only who asked.
+ * Keeping one implementation means the two can never drift into deleting
+ * different amounts.
+ *
+ * Goes:
+ *   - the account and its seat in other people's rooms
+ *   - rooms it created, with every shape in them
+ *
+ * Stays:
+ *   - shapes it drew on other people's boards
+ *   - images it uploaded that other boards still show
+ *
+ * The second list is the schema's doing: Shape.userId and File.userId are
+ * nullable with onDelete SetNull, so deleting the row drops the authorship
+ * and leaves the work. A shape belongs to its room, not to whoever drew it,
+ * and nothing authorises by that column - so it stays editable by everyone
+ * who could edit it before.
+ *
+ * Rooms it created are the opposite case: their only owner is leaving and
+ * there is no way to transfer ownership, so a board nobody can administer
+ * would be left behind. It goes with them - including anything other people
+ * drew in it, which is the one genuinely lossy part of this.
+ */
+export async function deleteAccount(userId: string): Promise<{ rooms: number }> {
+  const owned = await prismaClient.room.findMany({
+    where: { adminId: userId },
+    select: { id: true },
+  });
+
+  // One transaction for the whole account: a failure part-way through must
+  // leave it untouched, never an account whose rooms are gone but which still
+  // exists - or worse, a deleted account whose rooms survive with no owner.
+  await prismaClient.$transaction(async (tx) => {
+    for (const room of owned) {
+      await tx.shape.deleteMany({ where: { roomId: room.id } });
+      await tx.roomMember.deleteMany({ where: { roomId: room.id } });
+      await tx.room.delete({ where: { id: room.id } });
+    }
+    await tx.roomMember.deleteMany({ where: { userId } });
+    await tx.user.delete({ where: { id: userId } });
+  });
+
+  return { rooms: owned.length };
+}
+
+/**
  * Delete every guest whose session has expired. Safe to call at any time, and
  * safe to call twice - it only ever matches rows that are already past due.
  */
@@ -59,35 +108,8 @@ export async function sweepExpiredGuests(): Promise<SweepResult> {
   if (expired.length === 0) return { accounts: 0, rooms: 0 };
 
   let roomsRemoved = 0;
-
   for (const guest of expired) {
-    // Rooms the guest created. Their only owner is going, and the schema has
-    // no concept of transferring ownership, so a board nobody can administer
-    // would be left behind - it goes with them.
-    const owned = await prismaClient.room.findMany({
-      where: { adminId: guest.id },
-      select: { id: true },
-    });
-
-    // One transaction per guest rather than one for all of them: a failure
-    // part-way through leaves whole accounts done or untouched, never an
-    // account whose rooms are gone but which still exists.
-    await prismaClient.$transaction(async (tx) => {
-      for (const room of owned) {
-        await tx.shape.deleteMany({ where: { roomId: room.id } });
-        await tx.roomMember.deleteMany({ where: { roomId: room.id } });
-        await tx.room.delete({ where: { id: room.id } });
-      }
-      // their seat in other people's rooms; the work they did there stays
-      await tx.roomMember.deleteMany({ where: { userId: guest.id } });
-
-      // Shapes and files elsewhere are deliberately not touched. Deleting the
-      // user sets their userId to null, which keeps the work and loses only
-      // the name attached to it.
-      await tx.user.delete({ where: { id: guest.id } });
-    });
-
-    roomsRemoved += owned.length;
+    roomsRemoved += (await deleteAccount(guest.id)).rooms;
   }
 
   console.log(

@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import axios from "axios";
 import { Canvas } from "./Canvas";
-import { getToken } from "@/lib/session";
+import { getToken, installSessionGuard } from "@/lib/session";
 
 export function RoomCanvas({ slug }: { slug: string }) {
   const [roomId, setRoomId] = useState<number | null>(null);
@@ -11,6 +11,7 @@ export function RoomCanvas({ slug }: { slug: string }) {
 
   // Resolve slug → id
   useEffect(() => {
+    installSessionGuard();
     // getToken, not localStorage: an expired token is treated as no token,
     // so a session that ran out while the tab was closed says "sign in again"
     // rather than failing as a 401 somewhere further in

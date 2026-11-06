@@ -4,7 +4,7 @@ import {isLoggedIn} from "./middleware"
 import {JWT_SECRET} from '@repo/backend-common/config'
 import {CreateUserSchema,SigninUserSchema,CreateRoomSchema,ClaimAccountSchema,PresignUploadSchema,ConfirmUploadSchema,MAX_IMAGE_BYTES} from "@repo/common/types";
 import { guestUsername, MAX_NAME_ATTEMPTS } from "./guestNames";
-import { startGuestSweeper, GUEST_TTL_DAYS } from "./guestCleanup";
+import { startGuestSweeper, GUEST_TTL_DAYS, deleteAccount } from "./guestCleanup";
 import { presignPut, headObject, publicUrl, getObjectPrefix } from "./storage";
 import { readDimensions, HEADER_BYTES } from "./imageSize";
 import { prismaClient} from "@repo/db-package/client"
@@ -152,9 +152,65 @@ app.get("/me", isLoggedIn, async (req, res) => {
         select: { id: true, username: true, email: true, isGuest: true },
     })
     if (!user) {
-        return res.status(404).send({ message: "User not found" })
+        // 401, not 404: the token verified, but the account it names is gone
+        // - deleted, or swept after its guest session expired. The credential
+        // no longer identifies anyone, which is an authentication failure, and
+        // saying so is what lets the client sign out instead of sitting on a
+        // token that quietly fails every request.
+        return res.status(401).send({ message: "This account no longer exists" })
     }
     return res.send(user)
+})
+
+/**
+ * Delete the signed-in account, permanently.
+ *
+ * Same erasure as the expiry sweep, down to the same function: the account,
+ * its memberships and the rooms it created all go, while anything it drew on
+ * other people's boards stays and stays editable.
+ *
+ * A password is required when the account has one. The token alone is not
+ * enough for something irreversible - a borrowed laptop or a stolen token
+ * should not be able to destroy an account and every board on it. Guests have
+ * no password to ask for, so for them the confirmation is the UI's job.
+ */
+app.delete("/account", isLoggedIn, async (req, res) => {
+    //@ts-ignore - set by isLoggedIn
+    const userId: string = req.userId
+
+    const user = await prismaClient.user.findUnique({
+        where: { id: userId },
+        select: { password: true, isGuest: true },
+    })
+    if (!user) {
+        // 401, not 404: the token verified, but the account it names is gone
+        // - deleted, or swept after its guest session expired. The credential
+        // no longer identifies anyone, which is an authentication failure, and
+        // saying so is what lets the client sign out instead of sitting on a
+        // token that quietly fails every request.
+        return res.status(401).send({ message: "This account no longer exists" })
+    }
+
+    if (user.password) {
+        const password = req.body?.password
+        if (typeof password !== "string" || password.length === 0) {
+            return res.status(422).send({ message: "Enter your password to delete this account" })
+        }
+        const matches = await bcrypt.compare(password, user.password)
+        if (!matches) {
+            // 403 rather than 401: the token is fine, the confirmation is not,
+            // and a 401 would make the client think the session had expired
+            return res.status(403).send({ message: "That password is not correct" })
+        }
+    }
+
+    try {
+        const { rooms } = await deleteAccount(userId)
+        return res.send({ deleted: true, roomsDeleted: rooms })
+    } catch (err) {
+        console.error("[auth] account deletion failed:", err)
+        return res.status(500).send({ message: "Could not delete the account" })
+    }
 })
 
 /**
@@ -179,7 +235,12 @@ app.post("/account/claim", isLoggedIn, async (req, res) => {
         select: { isGuest: true },
     })
     if (!current) {
-        return res.status(404).send({ message: "User not found" })
+        // 401, not 404: the token verified, but the account it names is gone
+        // - deleted, or swept after its guest session expired. The credential
+        // no longer identifies anyone, which is an authentication failure, and
+        // saying so is what lets the client sign out instead of sitting on a
+        // token that quietly fails every request.
+        return res.status(401).send({ message: "This account no longer exists" })
     }
     if (!current.isGuest) {
         // not an error the UI should ever cause, but claiming twice would
