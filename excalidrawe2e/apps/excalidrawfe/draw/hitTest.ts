@@ -231,23 +231,61 @@ export function handleAt(bounds: Bounds, point: Point): Handle | null {
  * factors, which would drift.
  */
 /**
- * One scale factor for shapes that cannot stretch - a circle and a text.
+ * How far along its own diagonal a grip has been dragged.
  *
- * `factor` is the magnitude both axes agree on; `fx` and `fy` carry it back
- * with each axis's own sign, so a mirrored drag still mirrors. Position and
- * size must both be built from these, or the corner meant to stay pinned
- * drifts and the shape appears to move while being resized.
+ * For shapes that cannot stretch - a circle has one radius, a font one size -
+ * two axis factors have to collapse into one, and *which* one decides how the
+ * drag feels.
+ *
+ * Taking the smaller of the two is the obvious choice and a bad one. A text
+ * box is typically wide and short, so a pixel of vertical movement is a far
+ * bigger ratio than a pixel of horizontal movement; the minimum then throws
+ * away almost all of the vertical drag, and worse, the axis in control can
+ * swap part-way through. The size lurches and the corner never sits under the
+ * pointer.
+ *
+ * Projecting the cursor onto the grip's original offset from the anchor gives
+ * one number that moves continuously with the pointer, weights each axis by
+ * how long the box actually is along it, and cannot flip. It is the standard
+ * constrain-to-proportion behaviour, and it falls out correctly for edge
+ * grips too: with one span zero, the projection reduces to the ratio along
+ * the other axis.
  */
-function uniform(sx: number, sy: number): { fx: number; fy: number; factor: number } {
-    const factor = Math.min(Math.abs(sx), Math.abs(sy));
+function uniformFactor(spanX: number, spanY: number, toX: number, toY: number): number {
+    const lengthSquared = spanX * spanX + spanY * spanY;
+    if (lengthSquared === 0) return 1;
+    // magnitude only; mirroring is reapplied per axis by the caller, which
+    // knows which way each one went
+    return Math.abs((toX * spanX + toY * spanY) / lengthSquared);
+}
+
+/**
+ * Split a single factor back into signed per-axis ones.
+ *
+ * `fx` and `fy` carry the magnitude with each axis's own direction, so a
+ * mirrored drag still mirrors. Position and size must both be built from
+ * these, or the corner meant to stay pinned drifts and the shape appears to
+ * move while being resized.
+ */
+function uniform(sx: number, sy: number, factor?: number): { fx: number; fy: number; factor: number } {
+    // the projection when the caller has one; otherwise the old rule, so a
+    // caller that does not know about diagonals still behaves sanely
+    const magnitude = factor ?? Math.min(Math.abs(sx), Math.abs(sy));
     return {
-        fx: (sx < 0 ? -1 : 1) * factor,
-        fy: (sy < 0 ? -1 : 1) * factor,
-        factor,
+        fx: (sx < 0 ? -1 : 1) * magnitude,
+        fy: (sy < 0 ? -1 : 1) * magnitude,
+        factor: magnitude,
     };
 }
 
-export function scale(shape: Shape, anchor: Point, sx: number, sy: number): Shape {
+export function scale(
+    shape: Shape,
+    anchor: Point,
+    sx: number,
+    sy: number,
+    /** the diagonal projection, for the shapes that cannot stretch */
+    uniformScale?: number
+): Shape {
     const sizeX = (x: number) => anchor.x + (x - anchor.x) * sx;
     const sizeY = (y: number) => anchor.y + (y - anchor.y) * sy;
 
@@ -261,7 +299,7 @@ export function scale(shape: Shape, anchor: Point, sx: number, sy: number): Shap
         // centre by sx/sy while sizing the radius by the smaller of the two
         // makes the anchored corner drift, so the circle slides away from the
         // corner that is supposed to be pinned.
-        const { fx, fy, factor } = uniform(sx, sy);
+        const { fx, fy, factor } = uniform(sx, sy, uniformScale);
         return {
             ...shape,
             centerX: anchor.x + (shape.centerX - anchor.x) * fx,
@@ -290,7 +328,7 @@ export function scale(shape: Shape, anchor: Point, sx: number, sy: number): Shap
         // Same one-factor rule as the circle, and for the same reason: sizing
         // the glyphs by one number while placing them with another lets the
         // anchored corner drift.
-        const { fx, fy, factor } = uniform(sx, sy);
+        const { fx, fy, factor } = uniform(sx, sy, uniformScale);
         const b = boundsOf(shape);
         const mapX = (x: number) => anchor.x + (x - anchor.x) * fx;
         const mapY = (y: number) => anchor.y + (y - anchor.y) * fy;
@@ -326,7 +364,7 @@ export function scaleFactors(
     corner: Corner,
     anchor: Point,
     to: Point
-): { sx: number; sy: number } {
+): { sx: number; sy: number; uniform: number } {
     // Where the grabbed corner started, relative to the anchor. This is the
     // divisor, and its SIGN is the whole point: grabbing "nw" puts the corner
     // left of and above its anchor, so the offset is negative on both axes.
@@ -348,6 +386,7 @@ export function scaleFactors(
         // person was holding still.
         sx: spanX === 0 ? 1 : atLeast(to.x - anchor.x, MIN_SIZE) / spanX,
         sy: spanY === 0 ? 1 : atLeast(to.y - anchor.y, MIN_SIZE) / spanY,
+        uniform: uniformFactor(spanX, spanY, to.x - anchor.x, to.y - anchor.y),
     };
 }
 

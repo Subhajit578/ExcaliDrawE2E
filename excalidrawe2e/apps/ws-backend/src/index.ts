@@ -54,6 +54,27 @@ function requireRoom(socket: WebSocket, roomId: unknown): boolean {
  * catch, which refuses the message. Returning something truthy on failure
  * would let a hiccup grant permission to wipe a board.
  */
+/**
+ * Shapes announced to the room but not yet written.
+ *
+ * Broadcasting before persisting means a client can act on a shape that has
+ * no row yet - drag it, or erase it - and send an update or delete that would
+ * find nothing and be refused. Edits wait on the entry here, so the ordering
+ * the user sees is the ordering the database gets.
+ *
+ * Entries live for one write and are removed in a finally, so a failed write
+ * cannot wedge later edits behind a promise that never settles.
+ */
+const pendingCreates = new Map<string, Promise<unknown>>()
+
+/** Wait for a shape's create to finish, if one is still in flight. */
+async function awaitPendingCreate(id: unknown) {
+    if (typeof id !== "string") return
+    // a rejected create is still an answer: the row will not appear, and the
+    // caller should go on to find nothing rather than hang
+    await pendingCreates.get(id)?.catch(() => {})
+}
+
 async function isAdmin(roomId: unknown, userId: string): Promise<boolean> {
     if (typeof roomId !== "string" || roomId.length === 0) return false;
     const id = Number(roomId);
@@ -228,6 +249,11 @@ wss.on("connection" , function(socket,request){
                 socket.send(JSON.stringify({ type: "error", message: "Shape update is missing its data", id }));
                 return;
             }
+            // the create may still be in flight, now that shapes are announced
+            // before they are written: editing one the instant it appears must
+            // not race ahead of its own row
+            await awaitPendingCreate(id)
+
             const updated = await withDb(() =>  prismaClient.shape.updateMany({
                 // scoped to the room: membership of roomId alone must not let
                 // someone edit a shape that lives on another board
@@ -259,6 +285,11 @@ wss.on("connection" , function(socket,request){
                 socket.send(JSON.stringify({ type: "error", message: "Shape is missing a valid id" }));
                 return;
             }
+            // same reason as update_shape: erasing a shape the moment it
+            // appears must not reach the database before its own create does,
+            // or the delete matches nothing and the shape comes back
+            await awaitPendingCreate(id)
+
             const deleted = await withDb(() =>  prismaClient.shape.deleteMany({
                 where: { id, roomId: Number(roomId) },
             }))
@@ -291,11 +322,38 @@ wss.on("connection" , function(socket,request){
                 return;
             }
 
+            // Broadcast first, persist after.
+            //
+            // The write used to come first, which meant everyone else waited a
+            // database round trip - seconds, on a cold serverless Postgres -
+            // before a finished shape appeared. Nothing in the message needs
+            // the database to produce it: the client names its own shapes and
+            // sends complete geometry, so the row adds no information, only
+            // delay. Pencil strokes have always been relayed without touching
+            // the database and that is exactly why they feel immediate.
+            //
+            // Safe to send unconfirmed because receivers dedupe by id and the
+            // write below is an upsert, so a resend is a no-op. The cost is
+            // the failure path: if the write loses, everyone has been told
+            // about a shape that does not exist, so it has to be taken back.
+            users.forEach(user => {
+                if(user.rooms.includes(roomId)){
+                    user.socket.send(JSON.stringify({
+                        type:"shape",
+                        shape: { id, type: shape.type, data: shape.data },
+                        // relayed back so receivers can drop the live preview of
+                        // this stroke; without it the preview never clears
+                        strokeId: parsedData.strokeId ?? null,
+                        roomId
+                    }))
+                }
+            })
+
             // upsert, not create: a resend of the same id is a no-op instead of a
             // unique-constraint error. `update` stays empty on purpose - editing a
             // shape belongs to a future update_shape message that carries its own
             // ownership check.
-            const created = await withDb(() => prismaClient.shape.upsert({
+            const write = withDb(() => prismaClient.shape.upsert({
                 where: { id },
                 create: {
                     id,
@@ -306,18 +364,51 @@ wss.on("connection" , function(socket,request){
                 },
                 update: {},
             }))
-            users.forEach(user => {
-                if(user.rooms.includes(roomId)){
-                    user.socket.send(JSON.stringify({
-                        type:"shape",
-                        shape: created,
-                        // relayed back so receivers can drop the live preview of
-                        // this stroke; without it the preview never clears
+
+            // Registered while in flight so an edit or delete of this shape,
+            // which can now arrive before the row exists, waits for it rather
+            // than matching nothing and being refused.
+            pendingCreates.set(id, write)
+
+            try {
+                await write
+            } catch (err) {
+                // A write that reports failure has not necessarily failed.
+                // P1001 is a lost connection, and the row may well have been
+                // committed before the answer went missing - measured: three
+                // creates reported P1001 and all three were in the table
+                // afterwards. Retracting on the error alone would delete from
+                // every client a shape the database still holds, and a reload
+                // would bring it back from the dead.
+                //
+                // So ask before undoing anything. Only a shape confirmed
+                // absent is taken back.
+                console.error("[WS] shape create reported a failure:", err)
+                let stored = null
+                try {
+                    stored = await withDb(() => prismaClient.shape.findUnique({ where: { id } }))
+                } catch (checkErr) {
+                    // cannot even ask: leave the shape standing rather than
+                    // delete work on a guess. A stale client is recoverable by
+                    // reloading; a wrongly deleted shape is not.
+                    console.error("[WS] could not confirm shape, leaving it:", checkErr)
+                }
+
+                if (stored === null) {
+                    users.forEach(user => {
+                        if(user.rooms.includes(roomId)){
+                            user.socket.send(JSON.stringify({ type: "delete_shape", id, roomId }))
+                        }
+                    })
+                    socket.send(JSON.stringify({
+                        type: "error",
+                        message: "That shape could not be saved",
                         strokeId: parsedData.strokeId ?? null,
-                        roomId
                     }))
                 }
-            })
+            } finally {
+                pendingCreates.delete(id)
+            }
             return;
         }
       } catch (err) {

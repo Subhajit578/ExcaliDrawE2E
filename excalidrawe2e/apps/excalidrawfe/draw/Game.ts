@@ -1217,11 +1217,11 @@ export class Game {
         // click would be a row update for every missed grab
         if (e.clientX !== this.startX || e.clientY !== this.startY) {
           const { originals, corner, anchor, bounds } = resizing;
-          const { sx, sy } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
+          const { sx, sy, uniform } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
           // one message per shape: the protocol has no batch form, so resizing
           // ten shapes is ten update_shape frames on release
           for (const original of originals.values()) {
-            this.updateShape(scale(original, anchor, sx, sy));
+            this.updateShape(scale(original, anchor, sx, sy, uniform));
           }
         }
         return;
@@ -1401,10 +1401,10 @@ export class Game {
       // one pair of factors for the whole selection, from the box as it was at
       // mousedown - computing them from the shrinking box each frame would
       // compound, and the shapes would run away from the cursor
-      const { sx, sy } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
+      const { sx, sy, uniform } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
       const resized: Shape[] = [];
       for (const original of originals.values()) {
-        resized.push(scale(original, anchor, sx, sy));
+        resized.push(scale(original, anchor, sx, sy, uniform));
       }
       // local only - the new geometry goes out once, on mouseup
       this.applyShapes(resized);
