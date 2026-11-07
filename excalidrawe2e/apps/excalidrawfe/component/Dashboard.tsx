@@ -6,6 +6,8 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { getToken, clearToken, installSessionGuard } from "@/lib/session";
 import { ClaimAccountBanner } from "./ClaimAccountBanner";
 import { DeleteAccountDialog } from "./DeleteAccountDialog";
+import { Avatar } from "./Avatar";
+import { AvatarPicker } from "./AvatarPicker";
 import {
   Sparkles,
   Plus,
@@ -28,6 +30,8 @@ type Room = {
 /** A room someone else owns, opened through a shared link. */
 type JoinedRoom = Room & {
   owner?: string;
+  /** the owner's avatar id, resolved by the server */
+  ownerAvatar?: string;
   joinedAt?: string;
 };
 
@@ -65,7 +69,14 @@ export function Dashboard() {
   // who is signed in, so a guest can be offered the upgrade. Asked of the
   // server rather than read from the token: a token minted before the account
   // was claimed would keep claiming it is a guest.
-  const [me, setMe] = useState<{ username: string; email: string | null; isGuest: boolean } | null>(null);
+  const [me, setMe] = useState<{
+    username: string;
+    email: string | null;
+    isGuest: boolean;
+    /** the avatar to render - always a valid one, see the server's avatarFor */
+    avatar: string | null;
+  } | null>(null);
+  const [pickingAvatar, setPickingAvatar] = useState(false);
   const [claiming, setClaiming] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
 
@@ -235,13 +246,30 @@ export function Dashboard() {
             </div>
             <h1 className="text-xl font-bold text-gray-900">My Canvases</h1>
           </div>
-          <button
-            onClick={handleLogout}
-            className="flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900 transition-colors"
-          >
-            <LogOut className="w-4 h-4" />
-            Sign out
-          </button>
+          <div className="flex items-center gap-4">
+            {/* The avatar is the way into the picker. Nothing else on this
+                page is about the account itself, so a settings screen for one
+                choice would be a page nobody would find. */}
+            {me && (
+              <button
+                onClick={() => setPickingAvatar(true)}
+                title="Change your avatar"
+                className="group flex items-center gap-2.5 rounded-full py-1 pr-3 pl-1 transition-colors hover:bg-gray-100"
+              >
+                <Avatar id={me.avatar} username={me.username} size={34} />
+                <span className="hidden text-sm font-medium text-gray-700 sm:block">
+                  {me.username}
+                </span>
+              </button>
+            )}
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900 transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+              Sign out
+            </button>
+          </div>
         </div>
       </header>
 
@@ -465,9 +493,17 @@ export function Dashboard() {
 
                   <div className="p-4">
                     <h3 className="font-semibold text-gray-900 truncate">{room.slug}</h3>
-                    <p className="text-sm text-gray-600 mt-0.5">
-                      {room.owner ? `Owned by ${room.owner}` : "Shared canvas"}
-                    </p>
+                    <div className="mt-1 flex items-center gap-2">
+                      <Avatar
+                        id={room.ownerAvatar}
+                        username={room.owner}
+                        size={22}
+                        lazy
+                      />
+                      <p className="truncate text-sm text-gray-600">
+                        {room.owner ? `Owned by ${room.owner}` : "Shared canvas"}
+                      </p>
+                    </div>
 
                     <button
                       onClick={() => router.push(`/canvas/${room.slug}`)}
@@ -504,6 +540,15 @@ export function Dashboard() {
           </div>
         </section>
       </main>
+
+      {pickingAvatar && me && (
+        <AvatarPicker
+          current={me.avatar}
+          username={me.username}
+          onSaved={(avatar) => setMe({ ...me, avatar })}
+          onClose={() => setPickingAvatar(false)}
+        />
+      )}
 
       {deletingAccount && (
         <DeleteAccountDialog

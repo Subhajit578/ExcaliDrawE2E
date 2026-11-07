@@ -4,6 +4,7 @@ import { imageUrl, uploadImage, isSupportedImage } from "./images";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 import { SELECT_TOLERANCE, ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
 import { circleFromDrag, elbowPoints } from "./routing";
+import { IDENTITY_CAMERA, type Camera } from "./camera";
 import {
   boundsBetween,
   boundsOf,
@@ -169,6 +170,19 @@ export class Game {
   /** shape id -> when it appeared, so a fading pad can be drawn behind it */
   private appearing: Map<string, number> = new Map();
   private animationFrame: number | null = null;
+  /**
+   * Where the board is being looked at from.
+   *
+   * View state, not board state: it is never sent, never stored, and every
+   * person in a room has their own. Shapes are stored in world coordinates
+   * and know nothing about it.
+   *
+   * Starts at the identity, which is exactly how the board behaved before a
+   * camera existed - so coordinates saved then are already world coordinates
+   * and nothing needs migrating.
+   */
+  private camera: Camera = IDENTITY_CAMERA;
+
   /* ── selection and dragging ─────────────────────────────────────────── */
   /**
    * Ids of the selected shapes, each outlined and moved together.
@@ -480,7 +494,13 @@ export class Game {
    * shapes cover older ones.
    */
   clearCanvas() {
+    // device coordinates: the wipe has to cover the canvas itself, not a
+    // scrolled and scaled rectangle that used to
     this.renderer.clear(THEMES[this.theme].canvas);
+
+    // everything from here is in world coordinates
+    this.renderer.beginWorld(this.camera.scrollX, this.camera.scrollY, this.camera.zoom);
+    try {
     const now = performance.now();
     
     this.existingShapes.forEach((shape) => {
@@ -593,6 +613,11 @@ export class Game {
       for (const id of this.appearing.keys()) {
         if (!this.shapeIds.has(id)) this.appearing.delete(id);
       }
+    }
+    } finally {
+      // in a finally because a throw mid-paint would otherwise leave the
+      // transform set, and every later frame would compound on top of it
+      this.renderer.endWorld();
     }
   }
 

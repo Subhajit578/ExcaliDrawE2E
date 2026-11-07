@@ -157,7 +157,38 @@ export class ShapeRenderer {
     this.ctx.restore();
   }
 
-  /** wipe the canvas and lay down the board colour */
+  /**
+   * Switch into world coordinates for everything drawn until endWorld().
+   *
+   * Plain numbers rather than a Camera, so this file stays ignorant of the
+   * camera module - and so the two do not end up importing each other, since
+   * camera.ts already takes Point from here.
+   *
+   * setTransform, not translate + scale: it sets the matrix absolutely rather
+   * than multiplying into whatever was there, so a missed restore cannot
+   * compound frame after frame into a board drifting off screen.
+   *
+   * The matrix is screen = (world + scroll) * zoom, which as (a,b,c,d,e,f) is
+   * a scale of `zoom` on both axes and a translation of `scroll * zoom`.
+   */
+  beginWorld(scrollX: number, scrollY: number, zoom: number) {
+    this.ctx.save();
+    this.ctx.setTransform(zoom, 0, 0, zoom, scrollX * zoom, scrollY * zoom);
+  }
+
+  /** Back to device coordinates. Must pair with every beginWorld. */
+  endWorld() {
+    this.ctx.restore();
+  }
+
+  /**
+   * Wipe the canvas and lay down the board colour.
+   *
+   * Device coordinates, always - call it outside beginWorld. Under the camera
+   * transform this rectangle would itself be scrolled and scaled, so it would
+   * stop covering the canvas and the board would grow an unpainted margin on
+   * two sides.
+   */
   clear(background: string) {
     const { width, height } = this.ctx.canvas;
     this.ctx.clearRect(0, 0, width, height);

@@ -2,11 +2,12 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import {isLoggedIn} from "./middleware"
 import {JWT_SECRET} from '@repo/backend-common/config'
-import {CreateUserSchema,SigninUserSchema,CreateRoomSchema,ClaimAccountSchema,PresignUploadSchema,ConfirmUploadSchema,MAX_IMAGE_BYTES} from "@repo/common/types";
+import {CreateUserSchema,SigninUserSchema,CreateRoomSchema,ClaimAccountSchema,PresignUploadSchema,ConfirmUploadSchema,UpdateAvatarSchema,MAX_IMAGE_BYTES} from "@repo/common/types";
 import { guestUsername, MAX_NAME_ATTEMPTS } from "./guestNames";
 import { startGuestSweeper, GUEST_TTL_DAYS, deleteAccount } from "./guestCleanup";
 import { presignPut, headObject, publicUrl, getObjectPrefix } from "./storage";
 import { readDimensions, HEADER_BYTES } from "./imageSize";
+import { STYLES, isAvatarId, randomAvatarId, avatarFor } from "./avatars";
 import { prismaClient} from "@repo/db-package/client"
 import cors from "cors"
 import bcrypt from "bcrypt"
@@ -52,7 +53,10 @@ app.post("/signup", async (req,res) => {
                 username: username,
                 email :  email,
                 password : hashedPassword,
-                photo : ""
+                // a face from the fixed pool, picked at random. Everyone
+                // arrives looking like someone rather than like a placeholder,
+                // and the dashboard lets them change it.
+                photo : randomAvatarId()
             },
         })
         res.status(200).send({message:"User created"})
@@ -118,14 +122,18 @@ app.post("/guest", async (req, res) => {
                     email: null,
                     password: null,
                     isGuest: true,
-                    photo: "",
+                    // guests get one too: a one-click account that looks
+                    // anonymous is harder to recognise in a shared room, and
+                    // the pool costs nothing to draw from
+                    photo: randomAvatarId(),
                 },
-                select: { id: true, username: true },
+                select: { id: true, username: true, photo: true },
             })
             return res.status(200).send({
                 token: issueToken(user),
                 username: user.username,
                 isGuest: true,
+                avatar: avatarFor(user.photo, user.id),
             })
         } catch (err: any) {
             if (err?.code === "P2002") continue   // name taken; the suffix widens
@@ -149,7 +157,7 @@ app.get("/me", isLoggedIn, async (req, res) => {
     const userId: string = req.userId
     const user = await prismaClient.user.findUnique({
         where: { id: userId },
-        select: { id: true, username: true, email: true, isGuest: true },
+        select: { id: true, username: true, email: true, isGuest: true, photo: true },
     })
     if (!user) {
         // 401, not 404: the token verified, but the account it names is gone
@@ -159,7 +167,73 @@ app.get("/me", isLoggedIn, async (req, res) => {
         // token that quietly fails every request.
         return res.status(401).send({ message: "This account no longer exists" })
     }
-    return res.send(user)
+    // `photo` is the stored column; `avatar` is what to render. They differ
+    // for accounts predating avatars and for anyone whose chosen style has
+    // since left the pool - see avatarFor.
+    const { photo, ...rest } = user
+    return res.send({ ...rest, avatar: avatarFor(photo, user.id) })
+})
+
+/**
+ * The avatar pool, grouped by style and in picker order.
+ *
+ * Unauthenticated on purpose: it is a list of paths to static files that
+ * anyone can already fetch, so requiring a token would protect nothing and
+ * would stop the sign-up page ever showing what is on offer.
+ *
+ * Served from the manifest rather than by listing the directory - the
+ * manifest is what the write path validates against, so the picker and the
+ * validator cannot disagree about what exists.
+ */
+app.get("/avatars", (_req, res) => {
+    return res.send({ styles: STYLES })
+})
+
+/**
+ * Change the signed-in account's avatar.
+ *
+ * The id is checked against the pool rather than believed. It is written to a
+ * column that the frontend interpolates straight into an asset path, so an
+ * unchecked value is both a broken image for everyone who sees this account
+ * and a string of someone else's choosing inside a URL. Same reasoning as
+ * /files/confirm reading the real image dimensions instead of taking the
+ * client's word: if the server is going to store it, the server checks it.
+ *
+ * PATCH rather than PUT: one field of the account, not the whole of it.
+ */
+app.patch("/me/avatar", isLoggedIn, async (req, res) => {
+    const parsed = UpdateAvatarSchema.safeParse(req.body)
+    if (!parsed.success) {
+        return res.status(422).send({
+            message: parsed.error.issues[0]?.message ?? "Pick an avatar",
+        })
+    }
+    if (!isAvatarId(parsed.data.avatar)) {
+        // 422, not 404: the request is well formed and the route exists, the
+        // value just is not one of the ones on offer
+        return res.status(422).send({ message: "That is not one of the available avatars" })
+    }
+
+    //@ts-ignore - set by isLoggedIn
+    const userId: string = req.userId
+
+    try {
+        const user = await prismaClient.user.update({
+            where: { id: userId },
+            data: { photo: parsed.data.avatar },
+            select: { id: true, photo: true },
+        })
+        return res.send({ avatar: avatarFor(user.photo, user.id) })
+    } catch (err: any) {
+        if (err?.code === "P2025") {
+            // the row is gone - deleted, or a guest swept after expiry. Same
+            // 401 as everywhere else, so the client signs out rather than
+            // retrying a request that can never succeed.
+            return res.status(401).send({ message: "This account no longer exists" })
+        }
+        console.error("[avatars] could not save avatar:", err)
+        return res.status(500).send({ message: "Could not save that avatar" })
+    }
 })
 
 /**
@@ -373,13 +447,16 @@ const memberships = await prismaClient.roomMember.findMany({
     orderBy: { joinedAt: "desc" },
     select: {
         joinedAt: true,
-        room: { select: { id: true, slug: true, createdAt: true, admin: { select: { username: true } } } },
+        room: { select: { id: true, slug: true, createdAt: true, admin: { select: { id: true, username: true, photo: true } } } },
     },
 })
 const joined = memberships.map((m) => ({
     ...m.room,
     joinedAt: m.joinedAt,
     owner: m.room.admin.username,
+    // resolved here rather than sent raw: the owner may predate avatars, and
+    // a blank column on someone else's card is a broken image on your page
+    ownerAvatar: avatarFor(m.room.admin.photo, m.room.admin.id),
 }))
 res.send({
     rooms: owned.map((r) => ({ ...r, owned: true })),

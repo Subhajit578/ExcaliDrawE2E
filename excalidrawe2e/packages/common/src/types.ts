@@ -81,3 +81,18 @@ export const ConfirmUploadSchema = z.object({
     width: z.number().int().positive().max(20000),
     height: z.number().int().positive().max(20000),
 });
+
+/**
+ * Choosing an avatar from the pool.
+ *
+ * Shape only - whether the id is actually one of the 72 is checked against
+ * the manifest on the server, because a schema that listed them would have to
+ * be regenerated alongside it and could drift out of step.
+ *
+ * The bound is a sanity limit on an id of the form "<style>/<nn>", not a
+ * guarantee: it keeps a megabyte of junk out of a column that is interpolated
+ * into an asset path.
+ */
+export const UpdateAvatarSchema = z.object({
+    avatar: z.string().min(3).max(64),
+})
