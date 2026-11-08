@@ -42,6 +42,23 @@ const SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  */
 const BATCH = 200;
 
+/**
+ * Largest `in` list a single delete statement will carry.
+ *
+ * Every id in the list is a bound parameter, and Postgres caps how many a
+ * statement may have. Keeping batches well under that also keeps each
+ * statement's lock short, which matters because these run inside a
+ * transaction.
+ */
+const DELETE_CHUNK = 1000;
+
+/** Split a list into runs of at most `size`. */
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 export type SweepResult = { accounts: number; rooms: number };
 
 /**
@@ -80,11 +97,24 @@ export async function deleteAccount(userId: string): Promise<{ rooms: number }> 
   // One transaction for the whole account: a failure part-way through must
   // leave it untouched, never an account whose rooms are gone but which still
   // exists - or worse, a deleted account whose rooms survive with no owner.
+  const roomIds = owned.map((room) => room.id);
+
+  // Three statements for every room was three round trips per room, all of
+  // them inside the transaction and so all of them holding its locks. An `in`
+  // list does the same work in one statement each, however many rooms there
+  // are, which turns the transaction from O(rooms) network hops into a fixed
+  // five - and against a remote Postgres the hops are the whole cost.
+  //
+  // Chunked, because an `in` list is a parameter per id and there is a limit
+  // on how many a statement may carry. A thousand keeps each statement small
+  // and each lock short; an account with more rooms than that simply takes a
+  // few passes.
   await prismaClient.$transaction(async (tx) => {
-    for (const room of owned) {
-      await tx.shape.deleteMany({ where: { roomId: room.id } });
-      await tx.roomMember.deleteMany({ where: { roomId: room.id } });
-      await tx.room.delete({ where: { id: room.id } });
+    for (const batch of chunk(roomIds, DELETE_CHUNK)) {
+      // order matters: children before parents, or the foreign keys refuse
+      await tx.shape.deleteMany({ where: { roomId: { in: batch } } });
+      await tx.roomMember.deleteMany({ where: { roomId: { in: batch } } });
+      await tx.room.deleteMany({ where: { id: { in: batch } } });
     }
     await tx.roomMember.deleteMany({ where: { userId } });
     await tx.user.delete({ where: { id: userId } });

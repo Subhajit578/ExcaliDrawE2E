@@ -10,19 +10,22 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1162.0",
     "@aws-sdk/s3-request-presigner": "^3.1162.0",
+    "@repo/backend-common": "workspace:*",
     "@types/bcrypt": "^6.0.0",
     "@types/express": "^5.0.3",
     "@types/jsonwebtoken": "^9.0.10",
     "bcrypt": "^6.0.0",
+    "compression": "^1.8.2",
     "cors": "^2.8.5",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.7.3",
     "jsonwebtoken": "^9.0.2"
   },
   "devDependencies": {
-    "@repo/backend-common": "workspace:*",
     "@repo/common": "workspace:*",
     "@repo/db-package": "workspace:*",
     "@repo/typescript-config": "workspace:*",
+    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.19"
   },
   "keywords": [],

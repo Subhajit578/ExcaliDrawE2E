@@ -2,6 +2,7 @@ import {WebSocket, WebSocketServer} from "ws";
 import jwt from "jsonwebtoken";
 import {JWT_SECRET} from '@repo/backend-common/config'
 import { prismaClient} from "@repo/db-package/client"
+import { updateShapesBatch, deleteShapesBatch } from "./batchWrites"
 const wss = new WebSocketServer({port : 8080})
 interface User {
     socket: WebSocket,
@@ -65,6 +66,15 @@ function requireRoom(socket: WebSocket, roomId: unknown): boolean {
  * Entries live for one write and are removed in a finally, so a failed write
  * cannot wedge later edits behind a promise that never settles.
  */
+/**
+ * Most shapes one batched message may carry.
+ *
+ * A ceiling on how much work a single message can ask for, so a malformed or
+ * hostile client cannot make the server build an enormous statement. Well
+ * above any real selection.
+ */
+const MAX_BATCH = 2000
+
 const pendingCreates = new Map<string, Promise<unknown>>()
 
 /** Wait for a shape's create to finish, if one is still in flight. */
@@ -236,6 +246,77 @@ wss.on("connection" , function(socket,request){
             });
             return;
         }
+        // Many shapes in one message, for a gesture that touched a whole
+        // selection: a group drag, a group resize, a multi-delete. One
+        // message, one broadcast, one statement per chunk - instead of a
+        // message, a broadcast and a round trip per shape.
+        if (parsedData.type === "update_shapes" || parsedData.type === "delete_shapes") {
+            const roomId = parsedData.roomId;
+            if(!requireRoom(socket, roomId)) return;
+            const deleting = parsedData.type === "delete_shapes";
+            const items: unknown[] = Array.isArray(parsedData.updates)
+                ? parsedData.updates
+                : Array.isArray(parsedData.ids) ? parsedData.ids : [];
+
+            if (items.length === 0) return;
+            if (items.length > MAX_BATCH) {
+                socket.send(JSON.stringify({
+                    type: "error",
+                    message: `A single change cannot cover more than ${MAX_BATCH} shapes`,
+                }));
+                return;
+            }
+
+            const validId = (v: unknown): v is string =>
+                typeof v === "string" && v.length > 0 && v.length <= 100;
+
+            if (deleting) {
+                const ids = items.filter(validId);
+                if (ids.length !== items.length) {
+                    socket.send(JSON.stringify({ type: "error", message: "Shape is missing a valid id" }));
+                    return;
+                }
+                for (const id of ids) await awaitPendingCreate(id);
+                users.forEach(user => {
+                    if(user.rooms.includes(roomId)){
+                        user.socket.send(JSON.stringify({ type: "delete_shapes", ids, roomId }))
+                    }
+                })
+                try {
+                    await withDb(() => deleteShapesBatch(Number(roomId), ids))
+                } catch (err) {
+                    console.error("[WS] batch delete failed:", err)
+                    socket.send(JSON.stringify({ type: "error", message: "Those shapes could not be deleted" }))
+                }
+                return;
+            }
+
+            const updates = items as { id?: unknown; data?: unknown }[];
+            const clean = updates.filter(
+                (u) => validId(u?.id) && typeof u?.data === "object" && u.data !== null && !Array.isArray(u.data)
+            ) as { id: string; data: unknown }[];
+            if (clean.length !== updates.length) {
+                socket.send(JSON.stringify({ type: "error", message: "A shape update is missing its id or data" }));
+                return;
+            }
+
+            for (const u of clean) await awaitPendingCreate(u.id);
+            // broadcast first, for the same reason one shape does: the write
+            // adds nothing the receivers need, only delay
+            users.forEach(user => {
+                if(user.rooms.includes(roomId)){
+                    user.socket.send(JSON.stringify({ type: "update_shapes", updates: clean, roomId }))
+                }
+            })
+            try {
+                await withDb(() => updateShapesBatch(Number(roomId), clean))
+            } catch (err) {
+                console.error("[WS] batch update failed:", err)
+                socket.send(JSON.stringify({ type: "error", message: "Those changes could not be saved" }))
+            }
+            return;
+        }
+
         if(parsedData.type ==="update_shape") {
             const roomId = parsedData.roomId;
             if(!requireRoom(socket, roomId)) return;

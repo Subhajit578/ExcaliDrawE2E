@@ -24,16 +24,18 @@ export function AvatarPicker({
   username,
   onSaved,
   onClose,
+  onRollback,
 }: {
   current: string | null;
   username: string;
   onSaved: (avatar: string) => void;
   onClose: () => void;
+  /** told when an applied choice had to be undone, so it can be announced */
+  onRollback?: (message: string) => void;
 }) {
   const [styles, setStyles] = useState<AvatarStyle[] | null>(null);
   const [activeStyle, setActiveStyle] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(current);
-  const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -84,7 +86,20 @@ export function AvatarPicker({
     setActiveStyle(pick.split("/")[0] ?? activeStyle);
   }
 
-  async function handleSave() {
+  /**
+   * Apply the choice at once and close; reconcile afterwards.
+   *
+   * Picking an avatar is a preference, not a transaction - there is nothing
+   * to confirm and nothing that depends on the answer, so making someone
+   * watch a spinner to find out whether their own click worked is pure
+   * latency for no information.
+   *
+   * The server still has the last word: it validates the id against the pool
+   * and may answer with a different one, so its reply is applied when it
+   * differs. A refusal puts the old face back and says so, rather than
+   * leaving a face on screen that nobody else will ever see.
+   */
+  function handleSave() {
     if (!selected || selected === current) {
       onClose();
       return;
@@ -92,21 +107,27 @@ export function AvatarPicker({
     const token = getToken();
     if (!token) return;
 
-    setIsSaving(true);
-    setError(null);
-    try {
-      // the server's answer, not the local pick: it validates against the
-      // pool and is the thing every other viewer will be given
-      const saved = await saveAvatar(selected, token);
-      onSaved(saved);
-      onClose();
-    } catch (err) {
-      const message = axios.isAxiosError(err)
-        ? err.response?.data?.message
-        : undefined;
-      setError(message ?? "Could not save that avatar");
-      setIsSaving(false);
-    }
+    const chosen = selected;
+    const previous = current;
+
+    onSaved(chosen);
+    onClose();
+
+    saveAvatar(chosen, token)
+      .then((saved) => {
+        // the pool is the server's to define; if it settled on something else
+        // that is what every other viewer will see
+        if (saved && saved !== chosen) onSaved(saved);
+      })
+      .catch((err) => {
+        const message = axios.isAxiosError(err) ? err.response?.data?.message : undefined;
+        // `current` may be null for an account that never had one; putting
+        // back an empty id is correct - avatarFor derives a stable fallback
+        onSaved(previous ?? "");
+        onRollback?.(
+          `Couldn't change your avatar - ${message ?? "the server refused"}. Put the old one back.`
+        );
+      });
   }
 
   return (
@@ -234,10 +255,10 @@ export function AvatarPicker({
             </button>
             <button
               onClick={handleSave}
-              disabled={isSaving || !selected}
+              disabled={!selected}
               className="rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 px-6 py-2.5 text-sm font-medium text-white shadow transition-all hover:from-indigo-700 hover:to-purple-700 disabled:opacity-50"
             >
-              {isSaving ? "Saving…" : "Save"}
+              Save
             </button>
           </div>
         </div>

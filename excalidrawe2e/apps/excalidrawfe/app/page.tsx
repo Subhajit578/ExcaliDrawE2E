@@ -184,7 +184,7 @@ function App() {
                 Perfect for every workflow
               </h2>
               <p className="text-xl text-gray-600 mb-8 leading-relaxed">
-                Whether you're a designer, developer, educator, or entrepreneur, 
+                Whether you&rsquo;re a designer, developer, educator, or entrepreneur,
                 ExcaliDraw adapts to your creative process.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

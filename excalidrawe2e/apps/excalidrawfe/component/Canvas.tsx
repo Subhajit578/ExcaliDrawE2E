@@ -19,12 +19,14 @@ import {
   Maximize,
   Hand,
   Compass,
-  Grid2x2
+  Grid2x2,
+  FileDown,
 } from "lucide-react";
 import { Game, TextRequest } from "@/draw/Game";
 import TextOverlay from "./TextOverlay";
 import { makeNotice, ToastStack, type Notice } from "./Toast";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { saveBoardAsPdf } from "@/lib/pdf";
 import {
   DEFAULT_FONT_FAMILY,
   DEFAULT_FONT_SIZE,
@@ -42,7 +44,16 @@ import {
 } from "@/draw/theme";
 export type Tool = "circle" | "rect" | "pencil" | "line" | "arrow" | "text" | "eraser" | "select" | "hand";
 
-export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }) {
+export function Canvas({
+  roomId,
+  slug,
+  socket,
+}: {
+  roomId: string;
+  /** the canvas's name, used for the exported filename */
+  slug: string;
+  socket: WebSocket;
+}) {
   const [size, setSize] = useState({ w: 0, h: 0 });
   /**
    * Physical pixels per CSS pixel.
@@ -61,6 +72,9 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
   // messages shown over the board: server refusals, load failures, confirmations
   const [notices, setNotices] = useState<Notice[]>([]);
   const [confirmingClear, setConfirmingClear] = useState(false);
+  // an export is seconds of work, not a toggle: the button is disabled
+  // while one runs so a double press cannot start two
+  const [exporting, setExporting] = useState(false);
   // mirrored from Game so the zoom readout and the text editor can react to
   // it; Game remains the owner, this is a copy for rendering
   const [camera, setCamera] = useState<Camera>(IDENTITY_CAMERA);
@@ -260,6 +274,37 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
     setConfirmingClear(true);
   }
 
+  /**
+   * Save the board - or the selection, when there is one - as a PDF.
+   *
+   * Scope follows the selection rather than asking. Someone with shapes
+   * selected who presses export almost always means those shapes, and a
+   * menu offering a choice they have already made is a click in the way.
+   * Deselecting is the way to say "all of it".
+   *
+   * Guarded by `exporting` because this is not instant: a large board
+   * spends a second or two allocating and encoding a bitmap of tens of
+   * megapixels, and a second press would start a second one alongside it.
+   */
+  async function handleExportPdf() {
+    if (!game || exporting) return;
+    setExporting(true);
+    try {
+      const scope = game.hasSelection() ? "selection" : "board";
+      // renderExport explains itself to the person when it returns null
+      const render = await game.renderExport(scope);
+      if (render) {
+        const suffix = scope === "selection" ? "-selection" : "";
+        await saveBoardAsPdf(render, `${slug}${suffix}`);
+      }
+    } catch (err) {
+      console.error("[export] could not export the board", err);
+      showNotice("Could not export that board");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <div
       style={{
@@ -395,6 +440,8 @@ export function Canvas({ roomId, socket }: { roomId: string; socket: WebSocket }
         onZoomOut={() => game?.zoomBy(1 / 1.2)}
         onResetView={() => game?.resetView()}
         onZoomToFit={() => game?.zoomToFit()}
+        onExportPdf={handleExportPdf}
+        exporting={exporting}
         gridOn={gridOn}
         onToggleGrid={() => game?.toggleGrid()}
         themeChoice={choice}
@@ -422,6 +469,8 @@ function TopBar({
   onZoomOut,
   onResetView,
   onZoomToFit,
+  onExportPdf,
+  exporting,
   gridOn,
   onToggleGrid,
   themeChoice,
@@ -438,6 +487,8 @@ function TopBar({
   onZoomOut: () => void;
   onResetView: () => void;
   onZoomToFit: () => void;
+  onExportPdf: () => void;
+  exporting: boolean;
   gridOn: boolean;
   onToggleGrid: () => void;
   themeChoice: ThemeChoice;
@@ -624,6 +675,15 @@ function TopBar({
         activated={gridOn}
         icon={<Grid2x2 size={20} />}
         title={gridOn ? "Hide the grid" : "Show the grid"}
+        {...iconProps}
+      />
+
+      <IconButton
+        onClick={onExportPdf}
+        activated={exporting}
+        icon={<FileDown size={20} />}
+        title={exporting ? "Exporting…" : "Export as PDF"}
+        disabled={exporting}
         {...iconProps}
       />
 

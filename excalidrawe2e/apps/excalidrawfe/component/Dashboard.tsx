@@ -1,5 +1,5 @@
 "use client";
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import axios from "axios";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -8,6 +8,7 @@ import { ClaimAccountBanner } from "./ClaimAccountBanner";
 import { DeleteAccountDialog } from "./DeleteAccountDialog";
 import { Avatar } from "./Avatar";
 import { AvatarPicker } from "./AvatarPicker";
+import { makeNotice, ToastStack, type Notice } from "./Toast";
 import {
   Sparkles,
   Plus,
@@ -50,6 +51,23 @@ export function Dashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  /**
+   * Transient messages, used mainly to announce a rollback.
+   *
+   * `errorMsg` renders *instead of* the canvas list, which is right for
+   * "nothing loaded" and wrong for "that one change did not stick" - it would
+   * blank the page to report a failed rename. An optimistic change that gets
+   * undone has to say so somewhere that does not destroy what the person is
+   * looking at.
+   */
+  const [notices, setNotices] = useState<Notice[]>([]);
+  const notify = useCallback((message: string, tone: "error" | "info" | "success" = "error") => {
+    setNotices((current) => [...current, makeNotice(message, tone)]);
+  }, []);
+  const dismissNotice = useCallback((id: string) => {
+    setNotices((current) => current.filter((n) => n.id !== id));
+  }, []);
+
   // Todo - Create a createModal 
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [newSlug, setNewSlug] = useState("");
@@ -59,7 +77,6 @@ export function Dashboard() {
   // Todo - Create rename modal
   const [renameTarget, setRenameTarget] = useState<Room | null>(null);
   const [renameSlug, setRenameSlug] = useState("");
-  const [isRenaming, setIsRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
 
   // Todo - Create share + per-card menu
@@ -184,38 +201,58 @@ export function Dashboard() {
     const room = deleteTarget;
     if (!room) return;
     setDeleteTarget(null);
+
+    // Where it was, not just that it was: restoring a rolled-back delete by
+    // appending would silently reorder the list, and the person would be left
+    // wondering whether something else had changed too.
+    const index = rooms.findIndex((r) => r.id === room.id);
+    setRooms((r) => r.filter((existing) => existing.id !== room.id));
+
     try {
       await axios.delete(`${API}/room/${room.id}`, { headers: authHeaders() });
-      setRooms((r) => r.filter((existing) => existing.id !== room.id));
     } catch (err: any) {
-      setErrorMsg(err?.response?.data?.message ?? "Failed to delete that canvas");
+      setRooms((r) => {
+        if (r.some((existing) => existing.id === room.id)) return r; // already back
+        const restored = [...r];
+        restored.splice(Math.max(0, index), 0, room);
+        return restored;
+      });
+      notify(
+        `Couldn't delete "${room.slug}" - ${err?.response?.data?.message ?? "the server refused"}. It's back in your list.`
+      );
     }
   }
 
   async function handleRename(e: React.FormEvent) {
     e.preventDefault();
     if (!renameTarget || !renameSlug.trim()) return;
-    setIsRenaming(true);
+    const target = renameTarget;
+    const wanted = renameSlug.trim();
+    const previous = target.slug;
+
+    // Show it renamed and get out of the way. Keeping the dialog open behind
+    // a spinner makes a rename feel like a transaction; it is a rename.
+    setRooms((r) => r.map((room) => (room.id === target.id ? { ...room, slug: wanted } : room)));
+    setRenameTarget(null);
+    setRenameSlug("");
     setRenameError(null);
+
     try {
-        console.log("[rename] sending", { id: renameTarget.id, slug: renameSlug });
       const res = await axios.patch(
-        `${API}/room/${renameTarget.id}`,
-        { slug: renameSlug.trim() },
+        `${API}/room/${target.id}`,
+        { slug: wanted },
         { headers: authHeaders() }
       );
-      console.log("[rename] got back", res.status, res.data);
-      setRooms((r) =>
-        r.map((room) =>
-          room.id === renameTarget.id ? { ...room, slug: res.data.slug } : room
-        )
-      );
-      setRenameTarget(null);
-      setRenameSlug("");
+      // reconcile with what the server actually stored rather than assuming
+      // it took our string verbatim - it may normalise it
+      if (res.data?.slug && res.data.slug !== wanted) {
+        setRooms((r) => r.map((room) => (room.id === target.id ? { ...room, slug: res.data.slug } : room)));
+      }
     } catch (err: any) {
-      setRenameError(err?.response?.data?.message ?? "Failed to rename");
-    } finally {
-      setIsRenaming(false);
+      setRooms((r) => r.map((room) => (room.id === target.id ? { ...room, slug: previous } : room)));
+      notify(
+        `Couldn't rename to "${wanted}" - ${err?.response?.data?.message ?? "the server refused"}. Still "${previous}".`
+      );
     }
   }
 
@@ -541,11 +578,14 @@ export function Dashboard() {
         </section>
       </main>
 
+      <ToastStack notices={notices} onDismiss={dismissNotice} />
+
       {pickingAvatar && me && (
         <AvatarPicker
           current={me.avatar}
           username={me.username}
           onSaved={(avatar) => setMe({ ...me, avatar })}
+          onRollback={(message) => notify(message)}
           onClose={() => setPickingAvatar(false)}
         />
       )}
@@ -622,8 +662,8 @@ export function Dashboard() {
             {renameError && <p className="text-sm text-red-600">{renameError}</p>}
             <ModalButtons
               onCancel={() => setRenameTarget(null)}
-              submitLabel={isRenaming ? "Saving..." : "Save"}
-              disabled={isRenaming}
+              submitLabel="Save"
+              disabled={false}
             />
           </form>
         </Modal>

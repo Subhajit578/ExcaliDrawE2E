@@ -63,9 +63,10 @@ export const DEFAULT_FONT_FAMILY =
  * Line widths are world units, so under the camera transform they scale with
  * the board - which is right, a drawing zoomed out should read as smaller.
  * But below one device pixel the canvas renders a line as faint partial
- * coverage, and by 15% a 1-unit stroke is 0.3px: shapes dissolve into a few
- * marks where the corners happen to overlap. Floor it, and a zoomed-out
- * board stays legible instead of disappearing.
+ * coverage, and at the 10% floor a 1-unit stroke is 0.2 device pixels on a
+ * Retina display: shapes dissolve into a few marks where the corners happen
+ * to overlap. Floor it, and a zoomed-out board stays legible instead of
+ * disappearing.
  */
 const MIN_STROKE_DEVICE_PX = 1;
 
@@ -426,8 +427,8 @@ export class ShapeRenderer {
     var dx = pointTo.x - pointFrom.x;
     var dy = pointTo.y - pointFrom.y; 
     var angle = Math.atan2(dy, dx);
-    // floored so an arrow still reads as an arrow when zoomed out: at 15% a
-    // fixed 10 units is 1.5 screen pixels, which is nothing
+    // floored so an arrow still reads as an arrow when zoomed out: at the
+    // 10% floor a fixed 10 units is 1 screen pixel, which is nothing
     const headlen = this.atLeastOnScreen(10, 8);
     this.ctx.moveTo(pointTo.x, pointTo.y); 
     this.ctx.lineTo(pointTo.x - headlen * Math.cos(angle - Math.PI / 6), pointTo.y - headlen * Math.sin(angle - Math.PI / 6));

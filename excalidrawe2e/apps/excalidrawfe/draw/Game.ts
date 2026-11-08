@@ -4,6 +4,12 @@ import { imageUrl, uploadImage, unsupportedReason, UploadError } from "./images"
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 import { SELECT_TOLERANCE, ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
 import { circleFromDrag, elbowPoints } from "./routing";
+import { paintShapes } from "./scene";
+import {
+  renderShapesToBlob,
+  type BoardRender,
+  type ExportScope,
+} from "./exportBoard";
 import {
   cameraCentredOn,
   cameraFitting,
@@ -311,6 +317,18 @@ export class Game {
    */
   private images: Map<string, ImageBitmap | "loading" | "failed"> = new Map();
 
+  /**
+   * Loads currently in flight, so one can be waited on.
+   *
+   * The painting path never waits for anything - it marks a hash "loading",
+   * starts a fetch and repaints when it lands. Export cannot work that way:
+   * it has exactly one chance to draw, and a hash that is still in flight at
+   * that moment becomes a dashed placeholder in the file. So the promise is
+   * kept as well as the result, and `ensureImage` hands back the one already
+   * running rather than starting a second fetch for the same bytes.
+   */
+  private imageLoads: Map<string, Promise<void>> = new Map();
+
   /* ── networking ─────────────────────────────────────────────────────── */
   socket: WebSocket;
   /** set by React; asks it to open a text editor at a point. See setOnTextRequest. */
@@ -617,6 +635,29 @@ export class Game {
    * second fetch - at 60fps a drag over an unloaded image would otherwise
    * launch dozens.
    */
+  /**
+   * Resolve once this hash is decoded, or known to be unavailable.
+   *
+   * Never rejects: a picture that cannot be fetched is a fact about the
+   * board, not a failure of whatever asked. Callers find out by looking at
+   * the cache, the same way the painter does.
+   */
+  private ensureImage(hash: string): Promise<void> {
+    const inFlight = this.imageLoads.get(hash);
+    if (inFlight) return inFlight;
+
+    const cached = this.images.get(hash);
+    if (cached instanceof ImageBitmap || cached === "failed") {
+      return Promise.resolve();
+    }
+
+    const load = this.loadImage(hash).finally(() => {
+      this.imageLoads.delete(hash);
+    });
+    this.imageLoads.set(hash, load);
+    return load;
+  }
+
   private async loadImage(hash: string) {
     this.images.set(hash, "loading");
     try {
@@ -630,6 +671,77 @@ export class Game {
       this.images.set(hash, "failed");
       this.clearCanvas();
     }
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════
+   * Export
+   * ══════════════════════════════════════════════════════════════════════ */
+
+  /** Whether anything is selected, so a caller can choose what to export. */
+  hasSelection(): boolean {
+    return this.selectedIds.size > 0;
+  }
+
+  /**
+   * The selected shapes, in z-order.
+   *
+   * Filtered out of the shape list rather than collected from the id set, so
+   * the result keeps list order - which is paint order. Reading the ids
+   * instead would return them in selection order, and a group exported that
+   * way would have its overlaps the wrong way round.
+   */
+  selectedShapes(): Shape[] {
+    return this.existingShapes.filter((shape) => this.selectedIds.has(shape.id));
+  }
+
+  /**
+   * Render the board, or the selection, to a bitmap.
+   *
+   * Returns null when there is nothing to draw, having already said so - the
+   * caller only has to handle the picture.
+   *
+   * The await in the middle is the point of the whole method. Painting is
+   * synchronous and cannot wait for a fetch, so a board drawn in the same
+   * frame it was asked for would export dashed placeholders wherever a
+   * picture had not happened to load yet. Everything is pulled in first, and
+   * only then is a frame drawn.
+   */
+  async renderExport(
+    scope: ExportScope,
+    requestedScale = 3
+  ): Promise<BoardRender | null> {
+    const shapes = scope === "selection" ? this.selectedShapes() : this.existingShapes;
+
+    if (shapes.length === 0) {
+      this.notify(
+        scope === "selection" ? "Nothing selected to export" : "Nothing to export yet",
+        "info"
+      );
+      return null;
+    }
+
+    const hashes = new Set<string>();
+    for (const shape of shapes) {
+      if (shape.type === "image") hashes.add(shape.hash);
+    }
+    await Promise.all([...hashes].map((hash) => this.ensureImage(hash)));
+
+    const render = await renderShapesToBlob(shapes, this.images, requestedScale);
+    if (!render) {
+      this.notify("That board is too large to export");
+      return null;
+    }
+
+    // said here rather than swallowed: a quietly softer file is the kind of
+    // thing someone discovers after printing it
+    if (render.scale < render.requestedScale - 0.01) {
+      this.notify(
+        `Exported at ${render.scale.toFixed(1)}x - the board is too large for ${render.requestedScale}x`,
+        "info"
+      );
+    }
+
+    return render;
   }
 
   /**
@@ -772,56 +884,30 @@ export class Game {
     }
 
     const now = performance.now();
-    
-    this.existingShapes.forEach((shape) => {
-      if (shape.id === this.editingId) return;
+
+    // the shapes themselves, through the one dispatch the exporter also
+    // uses - everything above and below this call is chrome, which is
+    // exactly what an export leaves out
+    paintShapes(this.renderer, this.existingShapes, {
       // stored colours are palette names now, but old rows hold raw hex
-      const color = this.paintColor(shape.color);
+      color: (stored) => this.paintColor(stored),
+      images: this.images,
+      placeholderColor: THEMES[this.theme].panelMuted,
+      // the shape being edited is hidden while its overlay is open
+      skipId: this.editingId,
+      onMissingImage: (hash) => void this.ensureImage(hash),
       // a pad behind anything that just appeared, fading over APPEAR_MS
-      const appearedAt = this.appearing.get(shape.id);
-      if (appearedAt !== undefined) {
+      highlightAlpha: (shape) => {
+        const appearedAt = this.appearing.get(shape.id);
+        if (appearedAt === undefined) return null;
         const progress = (now - appearedAt) / APPEAR_MS;
         if (progress >= 1) {
           this.appearing.delete(shape.id);
-        } else {
-          const b = boundsOf(shape);
-          // ease out: bright immediately, then away quickly
-          const alpha = 0.28 * (1 - progress) * (1 - progress);
-          this.renderer.highlight(b.left, b.top, b.right - b.left, b.bottom - b.top, color, alpha);
+          return null;
         }
-      }
-      if (shape.type === "rect") {
-        this.renderer.rect(shape.x, shape.y, shape.width, shape.height, color);
-      } else if (shape.type === "circle") {
-        this.renderer.circle(shape.centerX, shape.centerY, shape.radius, color);
-      } else if (shape.type === "pencil") {
-        this.renderer.stroke(shape.points, color);
-      } else if (shape.type === "line") {
-        this.renderer.polyline(shape.points, color);
-      } else if (shape.type === "arrow") {
-        this.renderer.arrow(shape.points, color);
-      }
-      else if (shape.type === "text") {
-        this.renderer.text(shape.x, shape.y, shape.text, color, shape.fontSize, shape.fontFamily);
-      }
-      else if (shape.type === "image") {
-        const cached = this.images.get(shape.hash);
-        if (cached instanceof ImageBitmap) {
-          this.renderer.image(cached, shape.x, shape.y, shape.width, shape.height);
-        } else {
-          // not here yet, or never coming: hold the space either way, so the
-          // board does not reflow when the picture lands
-          this.renderer.imagePlaceholder(
-            shape.x,
-            shape.y,
-            shape.width,
-            shape.height,
-            THEMES[this.theme].panelMuted,
-            cached === "failed"
-          );
-          if (cached === undefined) this.loadImage(shape.hash);
-        }
-      }
+        // ease out: bright immediately, then away quickly
+        return 0.28 * (1 - progress) * (1 - progress);
+      },
     });
     
     this.remoteStrokes.forEach((stroke) => {
@@ -1008,6 +1094,40 @@ export class Game {
           );
           this.clearCanvas();
         }
+        else if (message.type === "update_shapes") {
+          // the plural form of the branch above: one gesture by someone else,
+          // arriving as one message
+          const updates: { id: string; data: Record<string, unknown> }[] =
+            Array.isArray(message.updates) ? message.updates : [];
+          const byId = new Map(updates.map((u) => [u.id, u.data]));
+          for (const id of byId.keys()) this.pendingUpdates.delete(id);
+
+          let touched = false;
+          this.existingShapes = this.existingShapes.map((sh) => {
+            const data = byId.get(sh.id);
+            // a shape we are dragging right now is left alone, same as the
+            // single-shape branch: both sides writing a position many times a
+            // second makes it visibly oscillate
+            if (!data || this.dragOriginals.has(sh.id) || this.resizing?.originals.has(sh.id)) {
+              return sh;
+            }
+            touched = true;
+            return { ...sh, ...data, id: sh.id, type: sh.type } as Shape;
+          });
+          if (touched) this.clearCanvas();
+        }
+        else if (message.type === "delete_shapes") {
+          const ids: string[] = Array.isArray(message.ids) ? message.ids : [];
+          if (ids.length > 0) {
+            const gone = new Set(ids);
+            this.existingShapes = this.existingShapes.filter((sh) => !gone.has(sh.id));
+            for (const id of ids) {
+              this.shapeIds.delete(id);
+              this.forgetShape(id);
+            }
+            this.clearCanvas();
+          }
+        }
         else if(message.type === "delete_shape") {
           this.existingShapes = this.existingShapes.filter((s) => s.id !== message.id);
           this.shapeIds.delete(message.id);
@@ -1165,6 +1285,58 @@ export class Game {
       roomId: this.roomId,
     }) 
   }
+  /**
+   * Replace many shapes at once: locally, for everyone else, and in the
+   * database - in one message.
+   *
+   * A group gesture touches every shape in the selection, and sending one
+   * update per shape made the cost scale with the selection: fifty shapes was
+   * fifty messages and fifty round trips to Postgres, which measured at sixty
+   * seconds and did not all finish. The work is the same; it is the round
+   * trips that scale, so the gesture travels as one message and lands as one
+   * statement.
+   */
+  updateShapes(unrounded: Shape[]) {
+    const shapes = unrounded.map(roundShape);
+    const applied: Shape[] = [];
+
+    for (const shape of shapes) {
+      const previous = this.existingShapes.find((s) => s.id === shape.id);
+      if (!this.replaceShape(shape)) continue;
+      // the version from before this burst, so a refusal can be undone
+      if (previous && !this.pendingUpdates.has(shape.id)) {
+        this.pendingUpdates.set(shape.id, previous);
+      }
+      applied.push(shape);
+    }
+    if (applied.length === 0) return;
+
+    // one repaint for the whole set, not one per shape
+    this.clearCanvas();
+    this.send({
+      type: "update_shapes",
+      updates: applied.map(({ type, id, ...data }) => ({ id, data })),
+      roomId: this.roomId,
+    });
+  }
+
+  /** Delete many shapes at once, in one message. */
+  deleteShapes(ids: string[]) {
+    const removed: string[] = [];
+    for (const id of ids) {
+      const index = this.existingShapes.findIndex((s) => s.id === id);
+      if (index === -1) continue;
+      this.existingShapes.splice(index, 1);
+      this.shapeIds.delete(id);
+      this.forgetShape(id);
+      removed.push(id);
+    }
+    if (removed.length === 0) return;
+
+    this.clearCanvas();
+    this.send({ type: "delete_shapes", ids: removed, roomId: this.roomId });
+  }
+
   /**
    * Drop every reference to a shape that no longer exists.
    *
@@ -1666,11 +1838,10 @@ export class Game {
         if (at.x !== this.start.x || at.y !== this.start.y) {
           const { originals, corner, anchor, bounds } = resizing;
           const { sx, sy, uniform } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
-          // one message per shape: the protocol has no batch form, so resizing
-          // ten shapes is ten update_shape frames on release
-          for (const original of originals.values()) {
-            this.updateShape(scale(original, anchor, sx, sy, uniform));
-          }
+          // the whole selection in one message, however large it is
+          this.updateShapes(
+            [...originals.values()].map((o) => scale(o, anchor, sx, sy, uniform))
+          );
         }
         return;
       }
@@ -1692,11 +1863,8 @@ export class Game {
       // a click that selected without moving: nothing to broadcast, and a
       // write per click would be a row update for every selection
       if (dragged.size > 0 && (dx !== 0 || dy !== 0)) {
-        // one message per shape: the protocol has no batch form, so a ten
-        // shape drag is ten update_shape frames on release
-        for (const original of dragged.values()) {
-          this.updateShape(translate(original, dx, dy));
-        }
+        // the whole selection in one message, however large it is
+        this.updateShapes([...dragged.values()].map((o) => translate(o, dx, dy)));
       }
       // select never builds a shape, so it stops before the chain below
       return;
@@ -1991,11 +2159,9 @@ export class Game {
         // only this key, and only once it is going to act: Backspace is
         // browser back-navigation in some contexts
         e.preventDefault();
-        // copied first: deleteShape removes the id from selectedIds through
-        // forgetShape, so iterating the live set would skip entries
-        for (const id of [...this.selectedIds]) {
-          this.deleteShape(id);
-        }
+        // copied first: deleteShapes removes each id from selectedIds through
+        // forgetShape, so passing the live set would mutate while iterating
+        this.deleteShapes([...this.selectedIds]);
         this.selectedIds.clear();
       } else if(key === "Escape") {
         this.selectedIds.clear();

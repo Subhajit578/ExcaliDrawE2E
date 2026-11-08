@@ -45,11 +45,13 @@ export const IDENTITY_CAMERA: Camera = { scrollX: 0, scrollY: 0, zoom: 1 };
  * frames, and without a floor the board reaches 1e-7, where every shape is
  * sub-pixel and there is no visual cue for how to get back.
  *
- * The floor is 15% rather than 10% because 10% was further out than anything
- * useful - shapes become specks and strokes thin to nothing well before it.
- * The cost is that zoom-to-fit can no longer frame a board that would need
- * less than 15%; it gets as close as the floor allows and leaves the rest
- * off screen.
+ * The floor is 10%, which is further out than most work needs - shapes are
+ * specks and a 1-unit stroke is below a device pixel well before it, which
+ * is why the renderer floors stroke widths and arrowheads rather than
+ * letting them vanish. It is set this far out on purpose: the alternative is
+ * a zoom-to-fit that cannot frame a large board at all, and being told "this
+ * is as far as it goes" with content still off screen is worse than a view
+ * that is small but complete.
  */
 export const MIN_ZOOM = 0.10;
 export const MAX_ZOOM = 10;
@@ -183,7 +185,7 @@ export function visibleWorldBounds(
  * The world distance between grid dots, chosen so they stay readable.
  *
  * A fixed spacing cannot work on an infinite canvas: 20 world units is a
- * comfortable grid at 100%, an unreadable moire at 15%, and a handful of
+ * comfortable grid at 100%, an unreadable moire at 10%, and a handful of
  * dots in the far corners at 500%. So the spacing steps up and down with
  * the zoom instead, always landing on a round number.
  *

@@ -1,10 +1,17 @@
 "use client";
 import { useEffect, useState } from "react";
+import { useParams } from "next/navigation";
 import axios from "axios";
 import { Canvas } from "./Canvas";
 import { getToken, installSessionGuard } from "@/lib/session";
 
-export function RoomCanvas({ slug }: { slug: string }) {
+export function RoomCanvas() {
+  // Read from the URL rather than taken as a prop from the server. That is
+  // what lets the page itself be a static shell: nothing about the render
+  // depends on which board this is.
+  const params = useParams<{ slug: string }>();
+  const slug = typeof params?.slug === "string" ? params.slug : "";
+
   const [roomId, setRoomId] = useState<number | null>(null);
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -63,5 +70,8 @@ export function RoomCanvas({ slug }: { slug: string }) {
   if (roomId === null) return <div className="p-8">Loading canvas...</div>;
   if (!socket) return <div className="p-8">Connecting to server...</div>;
 
-  return <Canvas roomId={String(roomId)} socket={socket} />;
+  // the slug as well as the id: the id is what the protocol speaks, but the
+  // slug is the name a person gave this canvas, so it is what an exported
+  // file should be called
+  return <Canvas roomId={String(roomId)} slug={slug} socket={socket} />;
 }

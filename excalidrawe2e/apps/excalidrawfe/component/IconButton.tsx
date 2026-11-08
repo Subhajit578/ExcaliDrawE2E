@@ -8,6 +8,7 @@ export function IconButton({
   activeColor,
   activeBackground,
   title,
+  disabled = false,
 }: {
   icon: ReactNode;
   onClick: () => void;
@@ -19,11 +20,20 @@ export function IconButton({
   /** pill behind the icon while selected */
   activeBackground: string;
   title?: string;
+  /**
+   * Greyed out and unclickable.
+   *
+   * For work that takes long enough to notice - an export allocating a
+   * bitmap of tens of megapixels - where a button that still looks live
+   * invites a second press that would start the whole thing again.
+   */
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       title={title}
       aria-pressed={activated}
       aria-label={title}
@@ -35,7 +45,8 @@ export function IconButton({
         border: "none",
         background: activated ? activeBackground : "transparent",
         color: activated ? activeColor : color,
-        cursor: "pointer",
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.5 : 1,
         lineHeight: 0,
         transition: "background 120ms ease, color 120ms ease",
       }}

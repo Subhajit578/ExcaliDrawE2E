@@ -5,15 +5,142 @@ import {JWT_SECRET} from '@repo/backend-common/config'
 import {CreateUserSchema,SigninUserSchema,CreateRoomSchema,ClaimAccountSchema,PresignUploadSchema,ConfirmUploadSchema,UpdateAvatarSchema,MAX_IMAGE_BYTES} from "@repo/common/types";
 import { guestUsername, MAX_NAME_ATTEMPTS } from "./guestNames";
 import { startGuestSweeper, GUEST_TTL_DAYS, deleteAccount } from "./guestCleanup";
-import { presignPut, headObject, publicUrl, getObjectPrefix } from "./storage";
+import { presignPut, headObject, publicUrl, getObjectPrefix, storageHealth } from "./storage";
 import { readDimensions, HEADER_BYTES } from "./imageSize";
 import { STYLES, isAvatarId, randomAvatarId, avatarFor } from "./avatars";
-import { prismaClient} from "@repo/db-package/client"
+import { prismaClient, dbGuard } from "@repo/db-package/client"
 import cors from "cors"
+import compression from "compression"
+import { createHash } from "crypto"
+import rateLimit from "express-rate-limit"
+import zlib from "zlib"
 import bcrypt from "bcrypt"
 const app = express()
+
+/**
+ * Compress responses on the way out.
+ *
+ * Registered before the routes, because it works by wrapping res.write and
+ * res.end - a route mounted earlier would answer without it.
+ *
+ * The payload this is for is GET /shapes/:roomId. Board JSON is almost
+ * entirely repetition - the same keys on every shape, a UUID-shaped userId,
+ * an ISO timestamp, the full font stack on every text, and pencil strokes
+ * that are {"x":n,"y":n} a hundred times over - so it compresses by around
+ * 80%. It is also the request a person waits on before seeing anything, and
+ * the one that grows without bound as a board fills up.
+ *
+ * Defaults are kept where they are already right, and that is most of them:
+ *
+ *   threshold  1KB. Below that the encoding header and the CPU cost exceed
+ *              the saving, so small replies - /me, /rooms, an error - go out
+ *              untouched.
+ *   filter     consults the Content-Type against the `compressible` table,
+ *              which already excludes image/*, video/* and archives. That is
+ *              what stops a PNG being deflated a second time for nothing.
+ *              Images are served from object storage rather than through
+ *              this process anyway, so they never reach here.
+ *   encoding   brotli when the client offers it, gzip otherwise, decided
+ *              from Accept-Encoding. Both are transparent to the browser.
+ *
+ * Vary: Accept-Encoding is set for us, which matters the moment anything
+ * caches these responses - without it a proxy could hand a brotli body to a
+ * client that cannot read it.
+ */
+app.use(compression({
+  // Brotli quality, raised from the library default of 4.
+  //
+  // At 4 brotli is actually *worse* than gzip on this payload - measured
+  // 42,119 bytes against gzip's 40,153 - which would be a silly outcome,
+  // because every current browser asks for brotli and would get the larger
+  // answer. Measured on a 200-shape board:
+  //
+  //   gzip level 6      40,153 bytes   4.5 ms
+  //   brotli quality 4  42,119 bytes   1.3 ms   (worse than gzip)
+  //   brotli quality 6  39,473 bytes   3.1 ms   (smaller AND faster)
+  //   brotli quality 9  38,499 bytes  11.8 ms   (1KB more for 4x the work)
+  //
+  // 6 is the point where it beats gzip on both size and time. Past that the
+  // curve flattens and the CPU is being spent per request, on the server, to
+  // save bytes the user will not notice.
+  // nested under `brotli`: a top-level `params` is read for gzip and
+  // silently ignored here, which looks like it worked and does nothing
+  brotli: { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 6 } },
+}))
+
 app.use(express.json())
-app.use(cors())
+/**
+ * Who may call this API from a browser.
+ *
+ * `cors()` with no arguments answers every origin with permission. Auth here
+ * is a Bearer header rather than a cookie, so a hostile page still cannot
+ * borrow a session it does not have - but it could use a token it obtained
+ * some other way, and an open API is a standing invitation to build things
+ * against it that then break when it is closed.
+ *
+ * An allowlist from the environment, defaulting to local development.
+ */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "http://localhost:3000")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    // no Origin header at all: curl, a mobile app, a server-to-server call.
+    // These are not browsers, so CORS is not what protects them - the token is.
+    if (!origin) return callback(null, true);
+    return callback(null, ALLOWED_ORIGINS.includes(origin));
+  },
+  credentials: true,
+}))
+
+/**
+ * Rate limits on the endpoints worth attacking.
+ *
+ * Nothing stood between a script and unlimited attempts at any of these.
+ * Signing in was free to brute force, and /guest would mint accounts as fast
+ * as the database could write them - each one a real row with a real
+ * username, kept for fifteen days.
+ *
+ * Keyed by IP, which is coarse: a shared NAT counts as one caller. The limits
+ * are therefore set where a human will not reach them.
+ */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { message: "Too many attempts - wait a few minutes and try again" },
+});
+
+const guestLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { message: "Too many guest sessions from here - try again later" },
+});
+
+app.use("/signin", authLimiter);
+app.use("/signup", authLimiter);
+app.use("/account/claim", authLimiter);
+app.use("/guest", guestLimiter);
+
+/**
+ * Liveness, and a window into the breakers.
+ *
+ * Deliberately touches nothing: no database, no object store. That is the
+ * point - if this stays fast while Postgres is on fire, the fire is
+ * contained. If it slows down too, something is still shared that should not
+ * be, and this is the endpoint that says so.
+ */
+app.get("/health", (_req, res) => {
+  res.send({
+    ok: true,
+    dependencies: [dbGuard.snapshot, storageHealth()],
+  });
+});
 
 /**
  * How long a session lasts.
@@ -185,8 +312,36 @@ app.get("/me", isLoggedIn, async (req, res) => {
  * manifest is what the write path validates against, so the picker and the
  * validator cannot disagree about what exists.
  */
-app.get("/avatars", (_req, res) => {
-    return res.send({ styles: STYLES })
+/**
+ * The avatar pool: the one response here that is the same for everybody.
+ *
+ * It is a build-time constant - the SVGs are generated and committed, and
+ * STYLES is read from the manifest - so it cannot change while the process
+ * runs. Serialising it per request, and making every browser revalidate it,
+ * was work with no possible variation in the answer.
+ *
+ * Rendered once at startup and hashed once, so a request costs a string
+ * comparison and a write. The ETag is the hash of the body, which means a
+ * deploy that changes the pool invalidates it on its own - there is no
+ * version to remember to bump.
+ *
+ * `public` is correct here and would be wrong almost anywhere else on this
+ * API: this endpoint takes no token and its answer does not depend on who is
+ * asking. Everything behind isLoggedIn is marked private below.
+ */
+const AVATARS_BODY = JSON.stringify({ styles: STYLES });
+const AVATARS_ETAG = `"${createHash("sha256").update(AVATARS_BODY).digest("hex").slice(0, 32)}"`;
+
+app.get("/avatars", (req, res) => {
+    res.set("Cache-Control", "public, max-age=300, stale-while-revalidate=86400");
+    res.set("ETag", AVATARS_ETAG);
+
+    // already has it: answer with nothing at all
+    if (req.headers["if-none-match"] === AVATARS_ETAG) {
+        return res.status(304).end();
+    }
+    res.type("application/json");
+    return res.send(AVATARS_BODY);
 })
 
 /**
@@ -380,19 +535,48 @@ app.get("/room/:slug", isLoggedIn, async(req , res) => {
         return res.send({room})
     }
 })
+/**
+ * Every shape on a board.
+ *
+ * Membership is checked, not just authentication. Before, any signed-in
+ * caller could read any board by its id - and those ids are sequential
+ * integers, and anyone can mint an account in one click from /guest, so
+ * "every private board in the system" was a short for-loop away.
+ *
+ * Admin or member. Those are the same two relations the join-by-link flow
+ * creates, so a person who legitimately opened a shared link already
+ * satisfies this by the time the canvas asks for shapes.
+ */
 app.get("/shapes/:roomId" , isLoggedIn, async (req, res) => {
     const roomId = Number(req.params.roomId)
+    //@ts-ignore - set by isLoggedIn
+    const userId: string = req.userId
     if(Number.isNaN(roomId)) {
         return res.status(404).send({message : "Invalid Room Id"})
     } else {
         try {
+            const room = await prismaClient.room.findUnique({
+                where: { id: roomId },
+                select: { adminId: true, members: { where: { userId }, select: { id: true } } },
+            })
+            // 404 rather than 403 for a board you are not in: telling the
+            // difference confirms which room ids exist and who owns them
+            if (!room || (room.adminId !== userId && room.members.length === 0)) {
+                return res.status(404).send({ message: "Invalid Room Id" })
+            }
+
             const shapes = await prismaClient.shape.findMany({
                 where : {roomId}, 
                 orderBy: {createdAt : "asc"}
             })
             res.send({shapes})
         } catch(err) {
-            return res.status(411).send({err : "Error Fetching content"})
+            // 500, not 411. Length Required means "your request had no
+            // Content-Length"; this is a failed read on our side and nothing
+            // the caller can fix by changing their request. It also made the
+            // browser console report a protocol error on every cold start,
+            // which sent me looking in the wrong place more than once.
+            return res.status(500).send({ message: "Could not load this board" })
         }
     }
 })
@@ -665,6 +849,32 @@ app.post("/files/confirm", isLoggedIn, async (req, res) => {
 
 // configurable so a second instance can be run alongside the dev one, for
 // example to exercise a route against the real database without restarting it
+/**
+ * Turn a refused dependency into an honest status code.
+ *
+ * A tripped breaker, a timeout and a full queue are all "we are not going to
+ * manage this right now, come back shortly" - which is 503 with a Retry-After,
+ * not 500. The difference matters to anything that retries: a 500 says the
+ * request was wrong or we are broken, a 503 says wait and it will probably
+ * work. Returning 500 for an overload invites clients to hammer a dependency
+ * that is already struggling.
+ *
+ * Last in the chain, so it only sees what the routes did not handle.
+ */
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) return next(err);
+  if (err?.name === "DependencyError") {
+    const seconds = err.code === "open" ? 10 : 2;
+    console.warn(`[resilience] refusing: ${err.dependency} ${err.code}`);
+    return res.status(503).set("Retry-After", String(seconds)).send({
+      message: "Busy right now - please try again in a moment",
+      reason: err.code,
+    });
+  }
+  console.error("[api] unhandled:", err);
+  return res.status(500).send({ message: "Something went wrong" });
+});
+
 // expired guests are unreachable accounts: swept so the table does not grow
 // without bound, and so their usernames come back into circulation
 startGuestSweeper();

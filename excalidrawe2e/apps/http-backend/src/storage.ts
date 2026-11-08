@@ -5,6 +5,35 @@ import {
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createGuard } from "@repo/backend-common/resilience";
+
+/**
+ * The object store is the second dependency that can hang.
+ *
+ * Only headObject reaches it - presigning is local HMAC and publicUrl is
+ * string building, so neither can block. But headObject runs on every upload
+ * confirm, and a wedged store would leave those requests holding sockets and
+ * Node handles for as long as the SDK's own retries take.
+ *
+ * Tighter limits than the database gets: an existence check should be fast,
+ * nothing else in the app depends on it, and the sensible answer when it is
+ * unwell is to stop asking rather than to wait.
+ */
+const storageGuard = createGuard({
+  name: "object-storage",
+  timeoutMs: Number(process.env.STORAGE_TIMEOUT_MS) > 0 ? Number(process.env.STORAGE_TIMEOUT_MS) : 4000,
+  concurrency: 20,
+  queueLimit: 50,
+  slowCallMs: 2000,
+  failureThreshold: 0.5,
+  minimumCalls: 5,
+  openMs: 15000,
+  halfOpenTrials: 2,
+  onStateChange: (from, to, name) => console.warn(`[resilience] ${name}: ${from} -> ${to}`),
+});
+
+/** For the health endpoint, so the breaker's state is observable. */
+export const storageHealth = () => storageGuard.snapshot;
 
 /**
  * Object storage, configured entirely from the environment.
@@ -114,8 +143,8 @@ export async function headObject(
   key: string
 ): Promise<{ size: number; mimeType: string } | null> {
   try {
-    const head = await s3.send(
-      new HeadObjectCommand({ Bucket: STORAGE_BUCKET, Key: key })
+    const head = await storageGuard.run(() =>
+      s3.send(new HeadObjectCommand({ Bucket: STORAGE_BUCKET, Key: key }))
     );
     return {
       size: head.ContentLength ?? 0,
