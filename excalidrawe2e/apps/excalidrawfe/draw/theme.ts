@@ -18,6 +18,15 @@ export const DEFAULT_COLOR: ColorName = "ink";
 export type Palette = {
   /** the drawing surface itself */
   canvas: string;
+  /**
+   * The dots of the background grid.
+   *
+   * Deliberately the faintest value in the palette. The grid is there to say
+   * "the board is moving" while panning empty space, and to give a sense of
+   * scale - the moment it competes with anything drawn on it, it is too
+   * strong.
+   */
+  grid: string;
   /** toolbar background, sitting over the canvas */
   panel: string;
   panelBorder: string;
@@ -31,6 +40,7 @@ export type Palette = {
 export const THEMES: Record<ThemeName, Palette> = {
   dark: {
     canvas: "#0b0c0f",
+    grid: "rgba(255, 255, 255, 0.15)",
     panel: "rgba(24, 26, 31, 0.88)",
     panelBorder: "rgba(255, 255, 255, 0.14)",
     panelText: "#f3f4f6",
@@ -47,6 +57,7 @@ export const THEMES: Record<ThemeName, Palette> = {
   },
   light: {
     canvas: "#fdfdfc",
+    grid: "rgba(17, 24, 39, 0.11)",
     panel: "rgba(255, 255, 255, 0.92)",
     panelBorder: "rgba(17, 24, 39, 0.12)",
     panelText: "#1f2937",

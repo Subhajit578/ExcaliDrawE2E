@@ -1,11 +1,24 @@
 import { Tool } from "@/component/Canvas";
 import { getExistingShapes } from "./http";
-import { imageUrl, uploadImage, isSupportedImage } from "./images";
+import { imageUrl, uploadImage, unsupportedReason, UploadError } from "./images";
 import { DEFAULT_COLOR, resolveColor, THEMES, type ThemeName } from "./theme";
 import { SELECT_TOLERANCE, ERASER_RADIUS, ShapeRenderer, type Point } from "./renderer";
 import { circleFromDrag, elbowPoints } from "./routing";
-import { IDENTITY_CAMERA, type Camera } from "./camera";
 import {
+  cameraCentredOn,
+  cameraFitting,
+  gridSpacing,
+  IDENTITY_CAMERA,
+  screenLengthToWorld,
+  toScreen,
+  toWorld,
+  visibleWorldBounds,
+  zoomAt,
+  type Camera,
+} from "./camera";
+import {
+  HANDLE_GRAB,
+  MIN_SIZE,
   boundsBetween,
   boundsOf,
   boundsUnion,
@@ -81,6 +94,15 @@ export type Shape =
  * shape arrives, then dropped in favour of the saved version. Never persisted.
  */
 type RemoteStroke = { color: string; points: Point[] };
+/**
+ * React's cue to open a text editor.
+ *
+ * `at` is a **world** point, like everything else stored. The editor is a
+ * real <textarea> and has to be positioned in screen pixels, but that
+ * conversion belongs to React, which knows the camera and can redo it when
+ * the board is panned or zoomed mid-edit. Sending a screen point here would
+ * freeze the editor to where the board happened to be when it opened.
+ */
 export type TextRequest = { at: Point; shape?: Extract<Shape, { type: "text" }> };
 /* ────────────────────────────────────────────────────────────────────────────
  * Helpers
@@ -154,8 +176,15 @@ export class Game {
 
   /* ── the drag in progress ───────────────────────────────────────────── */
   private clicked: boolean;
-  private startX = 0;
-  private startY = 0;
+  /**
+   * Where the current drag began, in **world** coordinates.
+   *
+   * World, not screen, because every delta computed from it is compared
+   * against shape geometry, which is world. Mixing the two gives a delta that
+   * is right at zoom 1 and quietly wrong everywhere else - the signature bug
+   * of adding a camera to code that did not have one.
+   */
+  private start: Point = { x: 0, y: 0 };
   /** points collected since the pencil went down */
   private currentStroke: Point[] = [];
   /** names the stroke being drawn, so receivers can drop their live copy */
@@ -182,6 +211,33 @@ export class Game {
    * and nothing needs migrating.
    */
   private camera: Camera = IDENTITY_CAMERA;
+  /** whether the background grid is drawn; purely a view preference */
+  private showGrid = true;
+  /** set by React, so the toolbar button can show the current state */
+  private onGridChange: ((on: boolean) => void) | null = null;
+  /**
+   * A pan in progress: where the pointer was last, in screen pixels.
+   *
+   * Screen, unlike every other drag in this file, and deliberately. Panning
+   * should move the board exactly as far as the hand moves, which is a screen
+   * distance - converting it to world first and back would make the board
+   * drift relative to the cursor at any zoom but 1.
+   */
+  private panFrom: Point | null = null;
+  /** Held space turns any drag into a pan, as in every other canvas tool. */
+  private spaceHeld = false;
+  /** set by React; lets the toolbar show the zoom and offer a reset */
+  private onCameraChange: ((camera: Camera) => void) | null = null;
+  /**
+   * set by React; fires when the board goes out of view, or comes back.
+   *
+   * Pushed rather than polled because it changes for two unrelated reasons -
+   * the camera moving, and the shapes themselves changing - and React has no
+   * way to know about the second.
+   */
+  private onContentVisibilityChange: ((visible: boolean) => void) | null = null;
+  /** last value sent, so the callback only fires on a real change */
+  private contentVisible = true;
 
   /* ── selection and dragging ─────────────────────────────────────────── */
   /**
@@ -301,6 +357,9 @@ export class Game {
   /** Detach the mouse listeners. The socket is closed by whoever opened it. */
   destroy() {
     this.canvas.removeEventListener("mousedown", this.mouseDownHandler);
+    this.canvas.removeEventListener("wheel", this.wheelHandler);
+    window.removeEventListener("keydown", this.spaceKeyHandler);
+    window.removeEventListener("keyup", this.spaceKeyHandler);
     window.removeEventListener("mouseup", this.mouseUpHandler);
     this.canvas.removeEventListener("mousemove", this.mouseMoveHandler);
     this.canvas.removeEventListener("dblclick", this.dblClickHandler);
@@ -332,8 +391,7 @@ export class Game {
     // One assignment, not three: eraser hides the system pointer behind its
     // own ring, select uses the arrow so hovering can swap in grab and resize
     // cursors, and everything else draws, so it gets a crosshair.
-    this.canvas.style.cursor =
-      tool === "eraser" ? "none" : tool === "select" ? "default" : "crosshair";
+    this.canvas.style.cursor = this.spaceHeld ? "grab" : this.cursorForTool();
 
     // clear the eraser ring when switching away, so it does not linger
     if (wasEraser && tool !== "eraser") {
@@ -376,6 +434,157 @@ export class Game {
    */
   setOnToolChange(cb: (tool: Tool) => void) {
     this.onToolChange = cb;
+  }
+
+  /** Let React follow the camera, for a zoom readout and a reset control. */
+  setOnCameraChange(cb: (camera: Camera) => void) {
+    this.onCameraChange = cb;
+    cb(this.camera);
+  }
+
+  getCamera(): Camera {
+    return this.camera;
+  }
+
+  setOnGridChange(cb: (on: boolean) => void) {
+    this.onGridChange = cb;
+    cb(this.showGrid);
+  }
+
+  toggleGrid() {
+    this.showGrid = !this.showGrid;
+    this.onGridChange?.(this.showGrid);
+    this.clearCanvas();
+  }
+
+  setOnContentVisibilityChange(cb: (visible: boolean) => void) {
+    this.onContentVisibilityChange = cb;
+    cb(this.contentVisible);
+  }
+
+  /**
+   * Whether any shape overlaps what is on screen.
+   *
+   * "Overlaps", not "is contained": a shape larger than the viewport, or one
+   * poking in at the edge, counts as visible. Being strict here would offer
+   * to rescue someone who can already see their work.
+   *
+   * An empty board counts as visible - there is nothing to be lost from.
+   */
+  private computeContentVisible(): boolean {
+    if (this.existingShapes.length === 0) return true;
+    const view = visibleWorldBounds(this.screenSize(), this.camera);
+    return shapesInBounds(this.existingShapes, view).length > 0;
+  }
+
+  /** Tell React, but only when the answer actually changed. */
+  private notifyContentVisibility() {
+    const visible = this.computeContentVisible();
+    if (visible === this.contentVisible) return;
+    this.contentVisible = visible;
+    this.onContentVisibilityChange?.(visible);
+  }
+
+  /**
+   * Scroll back to the nearest piece of work, without changing the zoom.
+   *
+   * Nearest rather than all of it: on a big board the thing you wandered off
+   * from is the thing you want back, and framing everything would throw away
+   * the magnification you were working at.
+   *
+   * Distance is measured to the shape's box rather than its centre, so a
+   * long line running past the viewport counts as close - its centre could
+   * be a long way off while the line itself is just out of frame.
+   */
+  scrollToNearestContent() {
+    if (this.existingShapes.length === 0) return;
+    const { width, height } = this.screenSize();
+    const centre = toWorld({ x: width / 2, y: height / 2 }, this.camera);
+
+    let best: Shape | null = null;
+    let bestDistance = Infinity;
+    for (const shape of this.existingShapes) {
+      const b = boundsOf(shape);
+      // distance from a point to a rectangle: zero inside it, otherwise the
+      // gap on each axis independently
+      const dx = Math.max(b.left - centre.x, 0, centre.x - b.right);
+      const dy = Math.max(b.top - centre.y, 0, centre.y - b.bottom);
+      const distance = Math.hypot(dx, dy);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = shape;
+      }
+    }
+    if (!best) return;
+
+    const b = boundsOf(best);
+    this.setCamera(
+      cameraCentredOn(
+        { x: (b.left + b.right) / 2, y: (b.top + b.bottom) / 2 },
+        { width, height },
+        this.camera.zoom
+      )
+    );
+  }
+
+  /**
+   * Move the camera and repaint.
+   *
+   * The single place the camera changes, so there is one place that remembers
+   * to tell React and one place that remembers to repaint - neither of which
+   * is obvious at the call sites.
+   */
+  private setCamera(next: Camera) {
+    if (
+      next.scrollX === this.camera.scrollX &&
+      next.scrollY === this.camera.scrollY &&
+      next.zoom === this.camera.zoom
+    ) {
+      return;
+    }
+    this.camera = next;
+    this.onCameraChange?.(next);
+    this.clearCanvas();
+  }
+
+  /** Back to looking at the origin at actual size. */
+  resetView() {
+    this.setCamera(IDENTITY_CAMERA);
+  }
+
+  /**
+   * Move the camera so the whole board is on screen.
+   *
+   * The answer to being lost on an infinite canvas, and more useful than
+   * resetting the view: the origin is only where the work is if nobody has
+   * scrolled, whereas this finds the work wherever it ended up.
+   *
+   * A shape being edited is included. It exists and has a position - leaving
+   * it out could fit a board that does not contain all of it.
+   */
+  zoomToFit() {
+    const bounds = boundsUnion(this.existingShapes);
+    if (!bounds) {
+      // nothing drawn: there is no "everything" to frame, and snapping to the
+      // origin would look like the button had misfired
+      this.notify("Nothing to fit yet", "info");
+      return;
+    }
+    const next = cameraFitting(bounds, this.screenSize());
+    if (next) this.setCamera(next);
+  }
+
+  /**
+   * Zoom a step in or out, centred on the viewport.
+   *
+   * For buttons and keyboard shortcuts, where there is no cursor to anchor
+   * on. Multiplicative, like the wheel: adding a constant feels fast when
+   * zoomed out and glacial when zoomed in.
+   */
+  zoomBy(factor: number) {
+    const { width, height } = this.screenSize();
+    const centre = { x: width / 2, y: height / 2 };
+    this.setCamera(zoomAt(this.camera, centre, this.camera.zoom * factor));
   }
 
   /** report something to the person, and keep it in the console for debugging */
@@ -424,6 +633,30 @@ export class Game {
   }
 
   /**
+   * A screen point - a drop position, a viewport centre - as a place on the
+   * board. For React, which only ever has screen coordinates to offer.
+   */
+  screenToWorld(point: Point): Point {
+    return toWorld(point, this.camera);
+  }
+
+  /**
+   * A place on the board, as a position on screen.
+   *
+   * For positioning DOM over the canvas - the text editor, and anything else
+   * that has to sit on top of a shape. The other edge of the same rule.
+   */
+  worldToScreen(point: Point): Point {
+    return toScreen(point, this.camera);
+  }
+
+  /** Where the middle of the visible area is, on the board. */
+  viewportCentreWorld(): Point {
+    const { width, height } = this.screenSize();
+    return toWorld({ x: width / 2, y: height / 2 }, this.camera);
+  }
+
+  /**
    * Put a file on the board.
    *
    * Upload first, shape second: a shape pointing at bytes that failed to store
@@ -431,17 +664,30 @@ export class Game {
    * Nothing is created until the hash is real.
    */
   async addImage(file: File, at: Point) {
-    if (!isSupportedImage(file)) {
-      this.notify("That file type is not supported");
+    const unsupported = unsupportedReason(file);
+    if (unsupported) {
+      this.notify(unsupported);
+      return;
+    }
+    if (file.size === 0) {
+      // a zero-byte file decodes to nothing, and the failure further down
+      // would read as a corrupt image rather than an empty one
+      this.notify(`${file.name || "That file"} is empty - there is nothing in it to upload.`);
       return;
     }
     try {
       const { hash, width, height } = await uploadImage(file);
 
-      // fit to a comfortable size on screen rather than the image's own, which
-      // for a screenshot is usually larger than the viewport
-      const maxOnScreen = Math.min(this.canvas.width, this.canvas.height) * 0.6;
-      const factor = Math.min(1, maxOnScreen / Math.max(width, height));
+      // Fit to a comfortable size on screen rather than the image's own,
+      // which for a screenshot is usually larger than the viewport.
+      //
+      // a fraction of what is visible, in CSS pixels, converted to a world
+      // size: zoomed out, the same fraction of the viewport is a much larger
+      // piece of the board.
+      const visible = this.screenSize();
+      const maxOnScreen = Math.min(visible.width, visible.height) * 0.6;
+      const maxInWorld = screenLengthToWorld(maxOnScreen, this.camera);
+      const factor = Math.min(1, maxInWorld / Math.max(width, height));
       const w = Math.round(width * factor);
       const h = Math.round(height * factor);
 
@@ -472,8 +718,16 @@ export class Game {
       this.onToolChange?.("select");
       this.clearCanvas();
     } catch (err) {
+      // Every step of the upload already knows why it failed; the only job
+      // here is to not flatten that back into "something went wrong". The
+      // original is still logged, because the sentence shown to the person is
+      // deliberately not the stack trace a developer wants.
       console.error("[canvas] image upload failed:", err);
-      this.notify("Could not upload that image");
+      this.notify(
+        err instanceof UploadError
+          ? err.message
+          : "Could not upload that image. Try again in a moment."
+      );
     }
   }
 
@@ -499,8 +753,24 @@ export class Game {
     this.renderer.clear(THEMES[this.theme].canvas);
 
     // everything from here is in world coordinates
-    this.renderer.beginWorld(this.camera.scrollX, this.camera.scrollY, this.camera.zoom);
+    this.renderer.beginWorld(
+      this.camera.scrollX,
+      this.camera.scrollY,
+      this.camera.zoom,
+      this.deviceRatio()
+    );
     try {
+
+    // first, so every shape sits on top of it
+    if (this.showGrid) {
+      this.renderer.grid(
+        visibleWorldBounds(this.screenSize(), this.camera),
+        gridSpacing(this.camera.zoom),
+        THEMES[this.theme].grid,
+        this.camera.zoom
+      );
+    }
+
     const now = performance.now();
     
     this.existingShapes.forEach((shape) => {
@@ -578,7 +848,8 @@ export class Game {
           b.top,
           b.right - b.left,
           b.bottom - b.top,
-          THEMES[this.theme].accent
+          THEMES[this.theme].accent,
+          this.camera.zoom
         );
       }
       for (const id of gone) this.forgetShape(id);
@@ -587,7 +858,7 @@ export class Game {
       // outlines above - a group resizes as a single object
       const bounds = this.selectionBounds();
       if (bounds) {
-        this.renderer.handles(handlesOf(bounds), THEMES[this.theme].accent);
+        this.renderer.handles(handlesOf(bounds), THEMES[this.theme].accent, this.camera.zoom);
       }
     }
 
@@ -599,13 +870,19 @@ export class Game {
         from.y,
         to.x - from.x,
         to.y - from.y,
-        THEMES[this.theme].accent
+        THEMES[this.theme].accent,
+        this.camera.zoom
       );
     }
 
     // the eraser's reach, on top of everything so it is never hidden
     if (this.selectedTool === "eraser" && this.cursor) {
-      this.renderer.eraserCursor(this.cursor, ERASER_RADIUS, THEMES[this.theme].panelMuted);
+      this.renderer.eraserCursor(
+        this.cursor,
+        this.px(ERASER_RADIUS),
+        THEMES[this.theme].panelMuted,
+        this.camera.zoom
+      );
     }
 
     // ids that no longer match a shape would keep the animation loop alive
@@ -619,6 +896,11 @@ export class Game {
       // transform set, and every later frame would compound on top of it
       this.renderer.endWorld();
     }
+
+    // after the paint, so it reflects exactly what was just drawn - and here
+    // rather than in setCamera, because shapes arriving or leaving can lose
+    // the board just as easily as scrolling away from it
+    this.notifyContentVisibility();
   }
 
   /**
@@ -910,14 +1192,15 @@ export class Game {
    * editor does.
    */
   private pointInSelection(point: Point): boolean {
+    const slack = this.px(SELECT_TOLERANCE);
     for (const shape of this.existingShapes) {
       if (!this.selectedIds.has(shape.id)) continue;
       const b = boundsOf(shape);
       if (
-        point.x >= b.left - SELECT_TOLERANCE &&
-        point.x <= b.right + SELECT_TOLERANCE &&
-        point.y >= b.top - SELECT_TOLERANCE &&
-        point.y <= b.bottom + SELECT_TOLERANCE
+        point.x >= b.left - slack &&
+        point.x <= b.right + slack &&
+        point.y >= b.top - slack &&
+        point.y <= b.bottom + slack
       ) {
         return true;
       }
@@ -945,7 +1228,7 @@ export class Game {
   private hoveredHandle(point: Point): Corner | null {
     const bounds = this.selectionBounds();
     if (!bounds) return null;
-    return handleAt(bounds, point)?.corner ?? null;
+    return handleAt(bounds, point, this.px(HANDLE_GRAB))?.corner ?? null;
   }
 
   /** Snapshot every selected shape, so a drag can be computed from originals. */
@@ -1007,8 +1290,110 @@ export class Game {
     this.clearCanvas();
   }
 
+  /**
+   * Wheel: scroll to pan, ctrl/cmd-wheel to zoom.
+   *
+   * The ctrlKey convention is not ours - a trackpad pinch is delivered by
+   * every browser as a wheel event with ctrlKey set, even when no key is
+   * held. Honouring it is how pinch-to-zoom works without touch handling.
+   *
+   * preventDefault throughout, or the browser pans the page and the pinch
+   * zooms the whole document instead of the board. passive: false is what
+   * makes that possible at all.
+   */
+  wheelHandler = (e: WheelEvent) => {
+    e.preventDefault();
+
+    if (e.ctrlKey || e.metaKey) {
+      // deltaY ranges from fractions on a trackpad to 100+ on a mouse, and
+      // deltaMode varies again in Firefox. Clamp rather than trust it, so one
+      // violent scroll cannot jump the whole zoom range in a frame.
+      const step = Math.exp(-Math.max(-50, Math.min(50, e.deltaY)) / 200);
+      this.setCamera(zoomAt(this.camera, this.screenPointOf(e), this.camera.zoom * step));
+      return;
+    }
+
+    // Plain scroll pans. The deltas are screen pixels, so they are divided by
+    // zoom to become the world distance the board should move - a flick of
+    // the wheel should cover the same amount of screen at any zoom.
+    this.setCamera({
+      ...this.camera,
+      scrollX: this.camera.scrollX - e.deltaX / this.camera.zoom,
+      scrollY: this.camera.scrollY - e.deltaY / this.camera.zoom,
+    });
+  };
+
+  /**
+   * Space is held, so the next drag pans instead of drawing.
+   *
+   * Checked in mousedown rather than switching tools, so the tool the person
+   * chose is still there when they let go.
+   */
+  private spaceKeyHandler = (e: KeyboardEvent) => {
+    if (e.code !== "Space") return;
+    if (isTypingTarget(document.activeElement)) return;
+    const held = e.type === "keydown";
+    if (held === this.spaceHeld) return;
+    this.spaceHeld = held;
+    // space also scrolls the page; while it is a pan modifier it must not
+    e.preventDefault();
+    this.canvas.style.cursor = held ? "grab" : this.cursorForTool();
+  };
+
+  /** The resting cursor for the active tool, with no gesture in progress. */
+  /**
+   * A constant measured in screen pixels, as a world distance right now.
+   *
+   * Hit tolerances, grip sizes and the "too small to be deliberate" floor are
+   * judged by eye and hand, so they are screen measures - but every
+   * comparison they take part in now happens in world space. Without this
+   * they would grow and shrink with the board: unhittable zoomed in,
+   * swallowing everything zoomed out.
+   */
+  /**
+   * Physical pixels per CSS pixel, as the canvas is actually set up.
+   *
+   * Measured from the element rather than read from window.devicePixelRatio,
+   * so it cannot disagree with how React sized the backing store - and so it
+   * follows the window being dragged to a display with a different density
+   * without anything having to listen for that.
+   */
+  private deviceRatio(): number {
+    const cssWidth = this.canvas.clientWidth;
+    if (!cssWidth) return 1;
+    return this.canvas.width / cssWidth;
+  }
+
+  /**
+   * The visible area in CSS pixels.
+   *
+   * canvas.width is the backing store, which is dpr times larger. Anything
+   * reasoning about what a person can see - where the middle of the screen
+   * is, how big a pasted image should look - wants this, not that.
+   */
+  private screenSize(): { width: number; height: number } {
+    const dpr = this.deviceRatio();
+    return { width: this.canvas.width / dpr, height: this.canvas.height / dpr };
+  }
+
+  private px(screenPixels: number): number {
+    return screenLengthToWorld(screenPixels, this.camera);
+  }
+
+  private cursorForTool(): string {
+    if (this.selectedTool === "eraser") return "none";
+    if (this.selectedTool === "hand") return "grab";
+    if (this.selectedTool === "select") return "default";
+    return "crosshair";
+  }
+
   initMouseHandlers() {
     this.canvas.addEventListener("mousedown", this.mouseDownHandler);
+    // not passive: this handler calls preventDefault on every event, and a
+    // passive listener is forbidden from doing so
+    this.canvas.addEventListener("wheel", this.wheelHandler, { passive: false });
+    window.addEventListener("keydown", this.spaceKeyHandler);
+    window.addEventListener("keyup", this.spaceKeyHandler);
     // on window, not the canvas: a mouseup outside the viewport never reaches
     // the canvas, which would leave a drag running with no button held
     window.addEventListener("mouseup", this.mouseUpHandler);
@@ -1019,12 +1404,29 @@ export class Game {
 
   /** where the cursor is now */
   private pointOf(e: MouseEvent): Point {
-    return { x: e.clientX, y: e.clientY };
+    return toWorld(this.screenPointOf(e), this.camera);
+  }
+
+  /**
+   * Where the pointer is on the canvas, in screen pixels.
+   *
+   * clientX is relative to the viewport, not to the canvas. Those coincide
+   * today only because the canvas sits at the origin - the moment anything
+   * gains a margin or a toolbar takes space, every coordinate is silently
+   * off by that much. getBoundingClientRect costs nothing here and removes
+   * the assumption.
+   *
+   * Needed by panning, which is the one thing that wants a screen delta, and
+   * by zooming, which anchors on the cursor's screen position.
+   */
+  private screenPointOf(e: MouseEvent): Point {
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
   /** where the current drag began */
   private dragStart(): Point {
-    return { x: this.startX, y: this.startY };
+    return this.start;
   }
 
   /**
@@ -1060,7 +1462,7 @@ export class Game {
    * the shape from existingShapes, so the next hit test cannot find it again.
    */
   private eraseAt(at: Point) {
-    const hit = hitTest(this.existingShapes, at, ERASER_RADIUS);
+    const hit = hitTest(this.existingShapes, at, this.px(ERASER_RADIUS));
     if (hit) this.deleteShape(hit.id);
   }
 
@@ -1070,9 +1472,21 @@ export class Game {
    * announces itself here.
    */
   mouseDownHandler = (e: MouseEvent) => {
+    // Panning comes before every tool: middle mouse, or space held. Checked
+    // first because the gesture should work whatever is selected - reaching
+    // for the move tool to scroll is exactly what an infinite canvas is
+    // meant to avoid.
+    if (e.button === 1 || this.spaceHeld || this.selectedTool === "hand") {
+      e.preventDefault();
+      this.panFrom = this.screenPointOf(e);
+      this.canvas.style.cursor = "grabbing";
+      return;
+    }
+    // any other non-primary button is not ours
+    if (e.button !== 0) return;
+
     this.clicked = true;
-    this.startX = e.clientX;
-    this.startY = e.clientY;
+    this.start = this.pointOf(e);
     // text is placed by a double click - see dblClickHandler. Opening the
     // editor from mousedown as well would unmount the one already being typed
     // in (the key changes), so the text would be discarded on the very click
@@ -1092,7 +1506,9 @@ export class Game {
       // the shape's own hit test would claim the press and start a move -
       // order is what decides which gesture you get.
       const selectionBox = this.selectionBounds();
-      const handle = selectionBox ? handleAt(selectionBox, this.pointOf(e)) : null;
+      const handle = selectionBox
+          ? handleAt(selectionBox, this.pointOf(e), this.px(HANDLE_GRAB))
+          : null;
       if (selectionBox && handle) {
         const opposite = handlesOf(selectionBox).find(
           (c) => c.corner === OPPOSITE[handle.corner]
@@ -1118,7 +1534,7 @@ export class Game {
       // outline first, then the inside: pressing in the middle of a rectangle
       // is a grab, not the start of a rubber band
       const hit =
-        hitTest(this.existingShapes, this.pointOf(e), SELECT_TOLERANCE) ??
+        hitTest(this.existingShapes, this.pointOf(e), this.px(SELECT_TOLERANCE)) ??
         hitTestInside(this.existingShapes, this.pointOf(e));
       // shift extends the selection; without it a click starts a new one
       const additive = e.shiftKey;
@@ -1200,7 +1616,7 @@ export class Game {
     if (this.selectedTool === "eraser") return;
 
     const hit =
-      hitTest(this.existingShapes, at, SELECT_TOLERANCE) ??
+      hitTest(this.existingShapes, at, this.px(SELECT_TOLERANCE)) ??
       hitTestInside(this.existingShapes, at);
     if (!hit) return;
 
@@ -1218,6 +1634,12 @@ export class Game {
    * because the id is already in shapeIds.
    */
   mouseUpHandler = (e: MouseEvent) => {
+    if (this.panFrom) {
+      this.panFrom = null;
+      this.canvas.style.cursor = this.spaceHeld ? "grab" : this.cursorForTool();
+      return;
+    }
+
     // this fires for every release in the page now, so a drag that never began
     // on the canvas must not commit anything: without this, a mousedown on the
     // toolbar released over the board would draw a shape from a stale origin
@@ -1240,7 +1662,8 @@ export class Game {
       if (resizing) {
         // a press on a grip that never moved changed nothing, and a write per
         // click would be a row update for every missed grab
-        if (e.clientX !== this.startX || e.clientY !== this.startY) {
+        const at = this.pointOf(e);
+        if (at.x !== this.start.x || at.y !== this.start.y) {
           const { originals, corner, anchor, bounds } = resizing;
           const { sx, sy, uniform } = scaleFactors(bounds, corner, anchor, this.pointOf(e));
           // one message per shape: the protocol has no batch form, so resizing
@@ -1263,8 +1686,9 @@ export class Game {
         return;
       }
 
-      const dx = e.clientX - this.startX;
-      const dy = e.clientY - this.startY;
+      const moved = this.pointOf(e);
+      const dx = moved.x - this.start.x;
+      const dy = moved.y - this.start.y;
       // a click that selected without moving: nothing to broadcast, and a
       // write per click would be a row update for every selection
       if (dragged.size > 0 && (dx !== 0 || dy !== 0)) {
@@ -1281,8 +1705,9 @@ export class Game {
     // text commits from the editor's blur, never from a mouseup
     if (this.selectedTool === "text") return;
 
-    const width = e.clientX - this.startX;
-    const height = e.clientY - this.startY;
+    const released = this.pointOf(e);
+    const width = released.x - this.start.x;
+    const height = released.y - this.start.y;
 
     const selectedTool = this.selectedTool;
     // the client names the shape, so the echo of it is recognisable as our own
@@ -1295,8 +1720,8 @@ export class Game {
       shape = {
         id,
         type: "rect",
-        x: this.startX,
-        y: this.startY,
+        x: this.start.x,
+        y: this.start.y,
         height,
         width,
         color: this.currentColor,
@@ -1353,7 +1778,7 @@ export class Game {
     // put an invisible row in the database that still sits in the z-order,
     // above everything drawn before it, swallowing clicks at that point.
     // Dropping it silently is right - the person did not mean to draw.
-    if (isDegenerate(shape)) {
+    if (isDegenerate(shape, this.px(MIN_SIZE))) {
       this.currentStroke = [];
       this.currentStrokeId = null;
       return;
@@ -1378,6 +1803,21 @@ export class Game {
    * mouseup, so other people see them appear on release.
    */
   mouseMoveHandler = (e: MouseEvent) => {
+    // a pan in progress owns the gesture; nothing else should react
+    if (this.panFrom) {
+      const now = this.screenPointOf(e);
+      // the one place a screen delta is the right thing: the board should
+      // keep pace with the hand exactly, so the world distance it moves is
+      // that screen distance divided by the zoom
+      this.setCamera({
+        ...this.camera,
+        scrollX: this.camera.scrollX + (now.x - this.panFrom.x) / this.camera.zoom,
+        scrollY: this.camera.scrollY + (now.y - this.panFrom.y) / this.camera.zoom,
+      });
+      this.panFrom = now;
+      return;
+    }
+
     // the eraser draws its reach under the cursor, so it needs the position on
     // every move - not only while the button is held
     if (this.selectedTool === "eraser") {
@@ -1398,8 +1838,9 @@ export class Game {
           // read from where the cursor is now, not from the corner that was
           // grabbed: dragging through the anchor turns an se grip into a sw
           // one, and the arrow has to turn with it
-          const dx = e.clientX - this.resizing.anchor.x;
-          const dy = e.clientY - this.resizing.anchor.y;
+          const at = this.pointOf(e);
+          const dx = at.x - this.resizing.anchor.x;
+          const dy = at.y - this.resizing.anchor.y;
           this.canvas.style.cursor =
             dx >= 0 === dy >= 0 ? "nwse-resize" : "nesw-resize";
         }
@@ -1412,7 +1853,7 @@ export class Game {
         this.canvas.style.cursor = RESIZE_CURSOR[corner];
       } else {
         const over =
-          hitTest(this.existingShapes, this.pointOf(e), SELECT_TOLERANCE) ??
+          hitTest(this.existingShapes, this.pointOf(e), this.px(SELECT_TOLERANCE)) ??
           hitTestInside(this.existingShapes, this.pointOf(e));
         this.canvas.style.cursor =
           over || this.pointInSelection(this.pointOf(e)) ? "grab" : "default";
@@ -1439,8 +1880,9 @@ export class Game {
     // a drag in progress: recompute every position from the originals and the
     // total offset since mousedown, never from the offset since the last move
     if (this.clicked && this.dragOriginals.size > 0) {
-      const dx = e.clientX - this.startX;
-      const dy = e.clientY - this.startY;
+      const cursor = this.pointOf(e);
+      const dx = cursor.x - this.start.x;
+      const dy = cursor.y - this.start.y;
       // local only - the moves go out once, on mouseup
       const moved: Shape[] = [];
       for (const original of this.dragOriginals.values()) {
@@ -1458,14 +1900,30 @@ export class Game {
     }
 
     if (this.clicked) {
-      const width = e.clientX - this.startX;
-      const height = e.clientY - this.startY;
+      const here = this.pointOf(e);
+      const width = here.x - this.start.x;
+      const height = here.y - this.start.y;
       this.clearCanvas();
       const color = this.paintColor(this.currentColor);
       const selectedTool = this.selectedTool;
 
+      // The preview is board content, so it has to be painted in the same
+      // space as the board. clearCanvas opens the camera transform and closes
+      // it again, so by here we are back in device coordinates - drawing
+      // world values straight onto that put the preview wherever those
+      // numbers happened to land in screen pixels. At the identity camera
+      // that is the right place, which is exactly why this survived until
+      // somebody zoomed out.
+      this.renderer.beginWorld(
+        this.camera.scrollX,
+        this.camera.scrollY,
+        this.camera.zoom,
+        this.deviceRatio()
+      );
+      try {
+
       if (selectedTool === "rect") {
-        this.renderer.rect(this.startX, this.startY, width, height, color);
+        this.renderer.rect(this.start.x, this.start.y, width, height, color);
       } else if (selectedTool === "circle") {
         const { centerX, centerY, radius } = circleFromDrag(
           this.dragStart(),
@@ -1505,6 +1963,10 @@ export class Game {
           elbowPoints(this.dragStart(), this.pointOf(e)),
           color
         );
+      }
+
+      } finally {
+        this.renderer.endWorld();
       }
     }
   };

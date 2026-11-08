@@ -20,7 +20,7 @@ export type Handle = { corner: Corner; x: number; y: number };
  * dot whose own handles are then too small to grab - unrecoverable without
  * deleting it and starting again.
  */
-const MIN_SIZE = 8;
+export const MIN_SIZE = 8;
 /** The grip that stays put while another is dragged. */
 export const OPPOSITE: Record<Corner, Corner> = {
     nw: "se",
@@ -77,9 +77,12 @@ export function roundShape(shape: Shape): Shape {
  * Measured on the bounding box, so it covers every type at once - including a
  * pencil "stroke" of a single point.
  */
-export function isDegenerate(shape: Shape): boolean {
+export function isDegenerate(shape: Shape, minimum = MIN_SIZE): boolean {
+    // the minimum is a world distance; a caller with a camera passes the
+    // world equivalent of MIN_SIZE screen pixels, so "too small to have been
+    // deliberate" means the same gesture at every zoom
     const b = boundsOf(shape);
-    return b.right - b.left < MIN_SIZE && b.bottom - b.top < MIN_SIZE;
+    return b.right - b.left < minimum && b.bottom - b.top < minimum;
 }
 
 /**
@@ -192,7 +195,7 @@ export function boundsUnion(shapes: Shape[]): Bounds | null {
  * outline's own padding, which puts the visible corner a few pixels outside
  * the grip drawn on it.
  */
-const HANDLE_GRAB = 12;
+export const HANDLE_GRAB = 12;
 
 /**
  * The handle under a point, or null.
@@ -206,9 +209,11 @@ const HANDLE_GRAB = 12;
  * one test; the first match wins, which the minimum size in resizeShape keeps
  * rare.
  */
-export function handleAt(bounds: Bounds, point: Point): Handle | null {
+export function handleAt(bounds: Bounds, point: Point, grab = HANDLE_GRAB): Handle | null {
+    // `grab` is a world distance. The caller converts, because only it knows
+    // the zoom: at 20% a fixed 12 world units would be a 2px target nobody
+    // can hit, and at 500% a 60px blob that swallows the shape.
     for (const handle of handlesOf(bounds)) {
-        const grab = HANDLE_GRAB;
         if (Math.abs(point.x - handle.x) <= grab && Math.abs(point.y - handle.y) <= grab) {
             return handle;
         }
